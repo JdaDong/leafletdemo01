@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Leaflet + 高德地图 Demo</title>
+
+    <!-- Leaflet 样式 -->
+    <link
+        rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin=""
+    />
+
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            width: 100%;
+            font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+        }
+        #map {
+            height: 100vh;
+            width: 100vw;
+        }
+        .map-title {
+            position: absolute;
+            top: 12px;
+            left: 60px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 8px 14px;
+            border-radius: 4px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+            font-size: 14px;
+            font-weight: bold;
+            color: #333;
+        }
+
+        /* POI 搜索面板 */
+        .poi-panel {
+            position: absolute;
+            top: 12px;
+            right: 60px;
+            z-index: 1000;
+            width: 320px;
+            background: #fff;
+            border-radius: 6px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+            overflow: hidden;
+            font-size: 13px;
+        }
+        .poi-panel .poi-input-wrap {
+            display: flex;
+            padding: 8px;
+            gap: 6px;
+            border-bottom: 1px solid #eee;
+            position: relative;
+        }
+        .poi-panel input {
+            flex: 1;
+            padding: 6px 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            outline: none;
+            font-size: 13px;
+            min-width: 0;
+        }
+        .poi-panel input:focus {
+            border-color: #1E88E5;
+        }
+        /* 分类筛选下拉 */
+        .poi-panel .poi-category-wrap {
+            display: flex;
+            padding: 6px 8px;
+            gap: 6px;
+            border-bottom: 1px solid #eee;
+            background: #fafafa;
+            align-items: center;
+        }
+        .poi-panel .poi-category-wrap label {
+            color: #666;
+            font-size: 12px;
+        }
+        .poi-panel select {
+            flex: 1;
+            padding: 5px 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            outline: none;
+            font-size: 13px;
+            background: #fff;
+            cursor: pointer;
+        }
+        .poi-panel select:focus {
+            border-color: #1E88E5;
+        }
+        /* 输入联想（搜索提示）下拉 */
+        .poi-tips {
+            position: absolute;
+            top: 100%;
+            left: 8px;
+            right: 8px;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-top: none;
+            border-radius: 0 0 4px 4px;
+            max-height: 240px;
+            overflow-y: auto;
+            z-index: 1001;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            display: none;
+        }
+        .poi-tips.active {
+            display: block;
+        }
+        .poi-tip-item {
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 13px;
+            border-bottom: 1px solid #f3f3f3;
+        }
+        .poi-tip-item:last-child {
+            border-bottom: none;
+        }
+        .poi-tip-item:hover,
+        .poi-tip-item.highlight {
+            background: #e3f2fd;
+        }
+        .poi-tip-item .tip-name {
+            color: #222;
+        }
+        .poi-tip-item .tip-district {
+            color: #999;
+            font-size: 11px;
+            margin-left: 6px;
+        }
+        .poi-panel button {
+            padding: 6px 14px;
+            background: #1E88E5;
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .poi-panel button:hover {
+            background: #1976D2;
+        }
+        .poi-panel button:disabled {
+            background: #9e9e9e;
+            cursor: not-allowed;
+        }
+        .poi-list {
+            max-height: 360px;
+            overflow-y: auto;
+        }
+        .poi-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid #f0f0f0;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .poi-item:hover {
+            background: #f5f9ff;
+        }
+        .poi-item .poi-name {
+            font-weight: bold;
+            color: #222;
+            margin-bottom: 3px;
+        }
+        .poi-item .poi-addr {
+            color: #888;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .poi-item .poi-index {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            line-height: 18px;
+            text-align: center;
+            background: #E53935;
+            color: #fff;
+            border-radius: 50%;
+            font-size: 11px;
+            margin-right: 6px;
+        }
+        .poi-tip {
+            padding: 12px;
+            color: #888;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="map-title">Leaflet + 高德地图</div>
+
+    <!-- POI 搜索面板 -->
+    <div class="poi-panel">
+        <div class="poi-input-wrap">
+            <input id="poi-input" type="text" placeholder="搜索地点，如：故宫、星巴克" autocomplete="off" />
+            <button id="poi-btn">搜索</button>
+            <!-- 输入联想下拉 -->
+            <div id="poi-tips" class="poi-tips"></div>
+        </div>
+        <!-- 分类筛选 -->
+        <div class="poi-category-wrap">
+            <label>分类：</label>
+            <select id="poi-category">
+                <option value="">全部</option>
+                <option value="050000">美食</option>
+                <option value="060000">购物</option>
+                <option value="070000">生活服务</option>
+                <option value="080000">体育休闲</option>
+                <option value="090000">医疗</option>
+                <option value="100000">住宿</option>
+                <option value="110000">风景名胜</option>
+                <option value="120000">商务住宅</option>
+                <option value="130000">政府机构</option>
+                <option value="140000">科教文化服务</option>
+                <option value="150000">交通设施</option>
+                <option value="160000">金融保险</option>
+                <option value="170000">公司企业</option>
+                <option value="180000">道路附属</option>
+                <option value="190000">地名地址</option>
+                <option value="200000">公共设施</option>
+            </select>
+        </div>
+        <div id="poi-list" class="poi-list"></div>
+    </div>
+
+    <div id="map"></div>
+
+    <!-- Leaflet JS -->
+    <script
+        src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+        crossorigin=""
+    ></script>
+
+    <!-- 业务脚本 -->
+    <script src="./src/main.js"></script>
+</body>
+</html>

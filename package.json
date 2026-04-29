@@ -1,0 +1,22 @@
+{
+  "name": "leafletdemo01",
+  "version": "1.0.0",
+  "description": "Leaflet + 高德地图 示例项目",
+  "main": "index.html",
+  "scripts": {
+    "start": "npx serve .",
+    "dev": "npx live-server --port=5173 --open=index.html",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["leaflet", "gaode", "amap", "map"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "leaflet": "^1.9.4"
+  },
+  "devDependencies": {
+    "live-server": "^1.2.2",
+    "serve": "^14.2.1"
+  }
+}
