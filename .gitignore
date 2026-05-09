@@ -4,3 +4,11 @@ node_modules/
 .idea/
 .vscode/
 dist/
+.vite/
+
+# 本地配置（含高德 Web Key 等敏感信息）
+src/config.local.js
+
+# Vite 环境变量（本地生效，含 Key）
+.env.local
+.env.*.local

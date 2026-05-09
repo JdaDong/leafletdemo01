@@ -5,13 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Leaflet + 高德地图 Demo</title>
 
-    <!-- Leaflet 样式 -->
-    <link
-        rel="stylesheet"
-        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-        crossorigin=""
-    />
+    <!--
+        注意：
+        Leaflet / Leaflet.markercluster / Leaflet.fullscreen 的 CSS 与 JS
+        已改为通过 Vite 从 node_modules 按需 import，
+        统一在 src/main.js 中 import，不再需要 CDN <link>/<script>。
+    -->
 
     <style>
         html, body {
@@ -29,14 +28,16 @@
             position: absolute;
             top: 12px;
             left: 60px;
-            z-index: 1000;
+            z-index: 900;
             background: rgba(255, 255, 255, 0.9);
-            padding: 8px 14px;
+            padding: 6px 12px;
             border-radius: 4px;
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-            font-size: 14px;
+            font-size: 13px;
             font-weight: bold;
             color: #333;
+            max-width: 220px;
+            white-space: nowrap;
         }
 
         /* POI 搜索面板 */
@@ -46,11 +47,18 @@
             right: 60px;
             z-index: 1000;
             width: 320px;
+            max-height: calc(100vh - 24px);
             background: #fff;
             border-radius: 6px;
             box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
             overflow: hidden;
             font-size: 13px;
+            display: flex;
+            flex-direction: column;
+        }
+        .poi-panel .poi-list {
+            flex: 1 1 auto;
+            min-height: 0;
         }
         .poi-panel .poi-input-wrap {
             display: flex;
@@ -137,6 +145,172 @@
             font-size: 11px;
             margin-left: 6px;
         }
+
+        /* 联想项的类型图标（不同类型用不同 emoji/颜色） */
+        .poi-tip-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .poi-tip-item .tip-icon {
+            flex: 0 0 auto;
+            width: 22px;
+            height: 22px;
+            line-height: 22px;
+            text-align: center;
+            border-radius: 50%;
+            font-size: 12px;
+            color: #fff;
+            background: #9E9E9E;
+        }
+        .poi-tip-item .tip-icon.type-poi      { background: #E53935; }  /* 🏢 POI */
+        .poi-tip-item .tip-icon.type-subway   { background: #3949AB; }  /* 🚇 地铁 */
+        .poi-tip-item .tip-icon.type-bus      { background: #43A047; }  /* 🚌 公交 */
+        .poi-tip-item .tip-icon.type-place    { background: #FB8C00; }  /* 📍 地名地址 */
+        .poi-tip-item .tip-icon.type-road     { background: #6D4C41; }  /* 🛣️ 道路 */
+        .poi-tip-item .tip-body {
+            flex: 1 1 auto;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        /* ========== 城市切换 & 视野内搜索 ========== */
+        .poi-panel .poi-city-wrap {
+            display: flex;
+            padding: 6px 8px;
+            gap: 6px;
+            border-bottom: 1px solid #eee;
+            background: #fafafa;
+            align-items: center;
+        }
+        .poi-panel .poi-city-wrap label {
+            color: #666;
+            font-size: 12px;
+            flex: 0 0 auto;
+        }
+        .poi-panel .poi-city-wrap select {
+            flex: 1 1 auto;
+            padding: 5px 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            outline: none;
+            font-size: 13px;
+            background: #fff;
+            cursor: pointer;
+            min-width: 0;
+        }
+        .poi-panel .poi-city-wrap select:focus {
+            border-color: #1E88E5;
+        }
+        .poi-panel button.poi-sub-btn {
+            flex: 0 0 auto;
+            padding: 5px 8px;
+            font-size: 12px;
+            background: #fff;
+            color: #1E88E5;
+            border: 1px solid #1E88E5;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .poi-panel button.poi-sub-btn:hover {
+            background: #e3f2fd;
+        }
+        .poi-panel button.poi-sub-btn.active {
+            background: #1E88E5;
+            color: #fff;
+        }
+
+        /* ========== 搜索历史 / 收藏下拉 ========== */
+        .poi-history {
+            position: absolute;
+            top: 100%;
+            left: 8px;
+            right: 8px;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-top: none;
+            border-radius: 0 0 4px 4px;
+            max-height: 320px;
+            overflow-y: auto;
+            z-index: 1001;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            display: none;
+        }
+        .poi-history.active { display: block; }
+        .poi-history .history-section {
+            border-bottom: 1px solid #f3f3f3;
+        }
+        .poi-history .history-section:last-child { border-bottom: none; }
+        .poi-history .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 10px;
+            background: #f7f9fc;
+            font-size: 11px;
+            color: #777;
+            font-weight: bold;
+        }
+        .poi-history .section-header .clear-btn {
+            background: none;
+            border: none;
+            color: #999;
+            cursor: pointer;
+            font-size: 11px;
+            padding: 0;
+        }
+        .poi-history .section-header .clear-btn:hover {
+            color: #E53935;
+            background: none;
+        }
+        .poi-history .history-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 13px;
+            border-bottom: 1px solid #f7f7f7;
+        }
+        .poi-history .history-item:last-child { border-bottom: none; }
+        .poi-history .history-item:hover { background: #e3f2fd; }
+        .poi-history .history-item .hi-icon {
+            flex: 0 0 auto;
+            color: #999;
+            font-size: 13px;
+        }
+        .poi-history .history-item .hi-name {
+            flex: 1 1 auto;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: #333;
+        }
+        .poi-history .history-item .hi-meta {
+            flex: 0 0 auto;
+            color: #999;
+            font-size: 11px;
+        }
+        .poi-history .history-item .hi-fav {
+            flex: 0 0 auto;
+            cursor: pointer;
+            color: #ccc;
+            font-size: 15px;
+            line-height: 1;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+        .poi-history .history-item .hi-fav:hover { background: #ffeeba; color: #f57c00; }
+        .poi-history .history-item .hi-fav.active { color: #FFB300; }
+        .poi-history .empty-tip {
+            padding: 10px;
+            color: #bbb;
+            font-size: 12px;
+            text-align: center;
+        }
         .poi-panel button {
             padding: 6px 14px;
             background: #1E88E5;
@@ -193,10 +367,933 @@
             color: #888;
             text-align: center;
         }
+
+        /* ========== 路径规划面板 ========== */
+        .route-panel {
+            position: absolute;
+            top: 56px;            /* 标题高度 ≈ 32px + 12px top + 12px 间距 */
+            left: 60px;
+            z-index: 950;
+            width: 300px;
+            background: #fff;
+            border-radius: 6px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+            overflow: hidden;
+            font-size: 13px;
+            max-height: calc(100vh - 80px);
+            display: flex;
+            flex-direction: column;
+        }
+        .route-panel .route-body {
+            overflow-y: auto;
+        }
+        .route-panel .route-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            background: #1E88E5;
+            color: #fff;
+            font-weight: bold;
+            cursor: pointer;
+            user-select: none;
+        }
+        .route-panel .route-header .toggle-icon {
+            font-size: 12px;
+            transition: transform 0.2s;
+        }
+        .route-panel.collapsed .route-header .toggle-icon {
+            transform: rotate(-90deg);
+        }
+        .route-panel.collapsed .route-body {
+            display: none;
+        }
+        .route-panel .route-modes {
+            display: flex;
+            gap: 4px;
+            padding: 8px;
+            border-bottom: 1px solid #eee;
+            background: #fafafa;
+        }
+        .route-panel .route-mode-btn {
+            flex: 1;
+            padding: 6px 0;
+            border: 1px solid #ddd;
+            background: #fff;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            color: #555;
+            transition: all 0.15s;
+        }
+        .route-panel .route-mode-btn.active {
+            background: #1E88E5;
+            color: #fff;
+            border-color: #1E88E5;
+        }
+        .route-panel .route-points {
+            padding: 8px 12px;
+        }
+        .route-panel .route-point {
+            display: flex;
+            align-items: center;
+            padding: 6px 0;
+            gap: 8px;
+        }
+        .route-panel .route-point .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .route-panel .route-point.origin .dot { background: #43A047; }
+        .route-panel .route-point.destination .dot { background: #E53935; }
+        .route-panel .route-point .text {
+            flex: 1;
+            color: #666;
+            font-size: 12px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .route-panel .route-point .text.empty {
+            color: #bbb;
+            font-style: italic;
+        }
+        /* 起/终点编辑态输入框 */
+        .route-panel .route-point .text.clickable {
+            cursor: text;
+            border-bottom: 1px dashed transparent;
+        }
+        .route-panel .route-point .text.clickable:hover {
+            border-bottom-color: #bbb;
+        }
+        .route-panel .route-point-input-wrap {
+            flex: 1;
+            position: relative;
+            display: none;
+            min-width: 0;
+        }
+        .route-panel .route-point-input-wrap.active {
+            display: block;
+        }
+        .route-panel .route-point-input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 4px 8px;
+            border: 1px solid #1E88E5;
+            border-radius: 4px;
+            outline: none;
+            font-size: 12px;
+            line-height: 18px;
+        }
+        /* 路径规划专用的联想下拉 */
+        .route-tips {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-top: none;
+            border-radius: 0 0 4px 4px;
+            max-height: 220px;
+            overflow-y: auto;
+            z-index: 1100;
+            display: none;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+        .route-tips.active {
+            display: block;
+        }
+        .route-tips .route-tip-item {
+            display: flex;
+            align-items: center;
+            padding: 6px 8px;
+            cursor: pointer;
+            border-bottom: 1px solid #f0f0f0;
+            gap: 6px;
+        }
+        .route-tips .route-tip-item:last-child { border-bottom: none; }
+        .route-tips .route-tip-item:hover,
+        .route-tips .route-tip-item.highlight {
+            background: #e3f2fd;
+        }
+        .route-tips .route-tip-item .tip-icon {
+            flex-shrink: 0;
+            width: 18px; height: 18px; line-height: 18px;
+            text-align: center; font-size: 11px;
+            background: #f0f0f0; border-radius: 50%;
+        }
+        .route-tips .route-tip-item .tip-body {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+        }
+        .route-tips .route-tip-item .tip-name {
+            font-size: 12px;
+            color: #333;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .route-tips .route-tip-item .tip-district {
+            font-size: 11px;
+            color: #999;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .route-tips .route-tip-empty {
+            padding: 8px;
+            text-align: center;
+            color: #bbb;
+            font-size: 12px;
+        }
+        .route-panel .route-point .clear-btn {
+            cursor: pointer;
+            color: #aaa;
+            font-size: 14px;
+            padding: 0 4px;
+        }
+        .route-panel .route-point .clear-btn:hover {
+            color: #E53935;
+        }
+        .route-panel .route-actions {
+            display: flex;
+            gap: 6px;
+            padding: 8px 12px;
+            border-top: 1px solid #eee;
+        }
+        .route-panel .route-actions button {
+            flex: 1;
+            padding: 6px 0;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .route-panel .route-actions .plan-btn {
+            background: #1E88E5;
+            color: #fff;
+        }
+        .route-panel .route-actions .plan-btn:hover { background: #1976D2; }
+        .route-panel .route-actions .plan-btn:disabled { background: #9e9e9e; cursor: not-allowed; }
+        .route-panel .route-actions .clear-all-btn {
+            background: #f5f5f5;
+            color: #555;
+            border: 1px solid #ddd;
+        }
+        .route-panel .route-actions .clear-all-btn:hover { background: #eee; }
+        .route-panel .route-summary {
+            padding: 8px 12px;
+            background: #f5f9ff;
+            border-top: 1px solid #e1efff;
+            font-size: 12px;
+            color: #333;
+            display: none;
+        }
+        .route-panel .route-summary.active { display: block; }
+        .route-panel .route-summary .summary-line {
+            margin: 2px 0;
+        }
+        .route-panel .route-summary .distance {
+            font-size: 14px;
+            font-weight: bold;
+            color: #1E88E5;
+        }
+        .route-panel .route-tip {
+            padding: 8px 12px;
+            color: #888;
+            font-size: 12px;
+            text-align: center;
+            background: #fafafa;
+        }
+        /* 公交专属：城市输入行（默认隐藏，仅 transit 模式展示） */
+        .route-panel .route-cities {
+            display: none;
+            gap: 6px;
+            padding: 8px 12px;
+            border-bottom: 1px solid #eee;
+            background: #fafafa;
+        }
+        .route-panel .route-cities.active {
+            display: flex;
+        }
+        .route-panel .route-cities input {
+            flex: 1;
+            padding: 5px 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            outline: none;
+            font-size: 12px;
+            min-width: 0;
+        }
+        .route-panel .route-cities input:focus {
+            border-color: #1E88E5;
+        }
+        .route-panel .route-cities .city-label {
+            font-size: 12px;
+            color: #666;
+            align-self: center;
+            flex-shrink: 0;
+        }
+        /* 公交换乘方案列表 */
+        .route-panel .route-transits {
+            display: none;
+            max-height: 260px;
+            overflow-y: auto;
+            border-top: 1px solid #e1efff;
+        }
+        .route-panel .route-transits.active {
+            display: block;
+        }
+        .route-panel .transit-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid #eee;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .route-panel .transit-item:hover {
+            background: #f5f9ff;
+        }
+        .route-panel .transit-item.active {
+            background: #e3f2fd;
+            border-left: 3px solid #1E88E5;
+            padding-left: 9px;
+        }
+        .route-panel .transit-item .transit-title {
+            font-size: 13px;
+            font-weight: bold;
+            color: #1E88E5;
+            margin-bottom: 2px;
+        }
+        .route-panel .transit-item .transit-meta {
+            font-size: 11px;
+            color: #888;
+            margin-bottom: 4px;
+        }
+        .route-panel .transit-item .transit-segs {
+            font-size: 12px;
+            color: #333;
+            line-height: 1.5;
+            word-break: break-all;
+        }
+        .route-panel .transit-item .seg-tag {
+            display: inline-block;
+            padding: 1px 5px;
+            border-radius: 3px;
+            margin: 0 2px;
+            font-size: 11px;
+            color: #fff;
+        }
+        .route-panel .transit-item .seg-tag.bus { background: #1E88E5; }
+        .route-panel .transit-item .seg-tag.subway { background: #43A047; }
+        .route-panel .transit-item .seg-tag.walk { background: #999; }
+        .route-panel .transit-item .seg-tag.railway { background: #8E24AA; }
+        .route-panel .transit-item .seg-sep {
+            color: #bbb;
+            margin: 0 2px;
+        }
+
+        /* ========== 地图右键菜单 ========== */
+        .map-context-menu {
+            position: absolute;
+            z-index: 2000;
+            background: #fff;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+            min-width: 160px;
+            padding: 4px 0;
+            font-size: 13px;
+            display: none;
+            overflow: hidden;
+        }
+        .map-context-menu.active { display: block; }
+        .map-context-menu .menu-item {
+            padding: 8px 14px;
+            cursor: pointer;
+            color: #333;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .map-context-menu .menu-item:hover {
+            background: #f5f9ff;
+            color: #1E88E5;
+        }
+        .map-context-menu .menu-divider {
+            height: 1px;
+            background: #eee;
+            margin: 4px 0;
+        }
+        .map-context-menu .menu-coord {
+            padding: 6px 14px;
+            color: #999;
+            font-size: 11px;
+            background: #fafafa;
+            border-bottom: 1px solid #eee;
+            font-family: Menlo, Monaco, monospace;
+        }
+
+        /* ========== POI 分页器 ========== */
+        .poi-pagination {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 12px;
+            border-top: 1px solid #eee;
+            background: #fafafa;
+            font-size: 12px;
+            color: #555;
+            gap: 6px;
+        }
+        .poi-pagination .page-btn {
+            padding: 4px 10px;
+            border: 1px solid #ddd;
+            background: #fff;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            color: #333;
+            transition: all 0.15s;
+        }
+        .poi-pagination .page-btn:hover:not(:disabled) {
+            border-color: #1E88E5;
+            color: #1E88E5;
+        }
+        .poi-pagination .page-btn:disabled {
+            color: #bbb;
+            cursor: not-allowed;
+            background: #f5f5f5;
+        }
+        .poi-pagination .page-info {
+            flex: 1;
+            text-align: center;
+            color: #666;
+        }
+        .poi-pagination .page-info .page-total {
+            color: #999;
+            margin-left: 4px;
+        }
+
+        /* ========== POI 详情抽屉 ========== */
+        .poi-drawer {
+            position: absolute;
+            top: 0;
+            right: 0;
+            height: 100vh;
+            width: 380px;
+            max-width: 90vw;
+            background: #fff;
+            box-shadow: -2px 0 16px rgba(0, 0, 0, 0.15);
+            z-index: 1500;
+            transform: translateX(100%);
+            transition: transform 0.28s ease;
+            display: flex;
+            flex-direction: column;
+            font-size: 13px;
+        }
+        .poi-drawer.active {
+            transform: translateX(0);
+        }
+        .poi-drawer .drawer-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            padding: 14px 16px;
+            background: linear-gradient(135deg, #1E88E5, #1976D2);
+            color: #fff;
+            flex-shrink: 0;
+        }
+        .poi-drawer .drawer-title {
+            flex: 1;
+            min-width: 0;
+        }
+        .poi-drawer .drawer-title .name {
+            font-size: 16px;
+            font-weight: bold;
+            line-height: 1.3;
+            word-break: break-all;
+        }
+        .poi-drawer .drawer-title .type {
+            font-size: 12px;
+            opacity: 0.85;
+            margin-top: 4px;
+        }
+        .poi-drawer .drawer-close {
+            width: 28px;
+            height: 28px;
+            line-height: 28px;
+            text-align: center;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 50%;
+            cursor: pointer;
+            flex-shrink: 0;
+            font-size: 16px;
+            transition: background 0.15s;
+        }
+        .poi-drawer .drawer-close:hover {
+            background: rgba(255, 255, 255, 0.35);
+        }
+        .poi-drawer .drawer-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0 0 16px 0;
+        }
+        .poi-drawer .drawer-photos {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 4px;
+            padding: 4px;
+            background: #f5f5f5;
+        }
+        .poi-drawer .drawer-photos .photo {
+            width: 100%;
+            aspect-ratio: 4 / 3;
+            object-fit: cover;
+            border-radius: 4px;
+            background: #e0e0e0;
+            cursor: pointer;
+            transition: transform 0.15s;
+        }
+        .poi-drawer .drawer-photos .photo:hover {
+            transform: scale(1.02);
+        }
+        .poi-drawer .drawer-photos.single {
+            grid-template-columns: 1fr;
+        }
+        .poi-drawer .drawer-photos.single .photo {
+            aspect-ratio: 16 / 9;
+        }
+        .poi-drawer .drawer-section {
+            padding: 12px 16px;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .poi-drawer .drawer-section:last-child {
+            border-bottom: none;
+        }
+        .poi-drawer .drawer-section .section-label {
+            font-size: 11px;
+            color: #999;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+        .poi-drawer .drawer-section .section-content {
+            color: #333;
+            line-height: 1.6;
+            word-break: break-all;
+        }
+        .poi-drawer .drawer-section .section-content a {
+            color: #1E88E5;
+            text-decoration: none;
+        }
+        .poi-drawer .drawer-section .section-content a:hover {
+            text-decoration: underline;
+        }
+        .poi-drawer .drawer-rating {
+            display: inline-block;
+            padding: 2px 8px;
+            background: #FF9800;
+            color: #fff;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .poi-drawer .drawer-rating.empty {
+            background: #bbb;
+        }
+        .poi-drawer .drawer-actions {
+            display: flex;
+            gap: 8px;
+            padding: 12px 16px;
+            border-top: 1px solid #eee;
+            background: #fafafa;
+            flex-shrink: 0;
+        }
+        .poi-drawer .drawer-actions button {
+            flex: 1;
+            padding: 8px 0;
+            border: 1px solid #ddd;
+            background: #fff;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            color: #333;
+            transition: all 0.15s;
+        }
+        .poi-drawer .drawer-actions button:hover {
+            border-color: #1E88E5;
+            color: #1E88E5;
+        }
+        .poi-drawer .drawer-actions button.primary {
+            background: #1E88E5;
+            color: #fff;
+            border-color: #1E88E5;
+        }
+        .poi-drawer .drawer-actions button.primary:hover {
+            background: #1976D2;
+            color: #fff;
+        }
+        .poi-drawer .drawer-loading,
+        .poi-drawer .drawer-empty {
+            padding: 30px 20px;
+            text-align: center;
+            color: #999;
+            font-size: 13px;
+        }
+
+        /* 图片灯箱 */
+        .photo-lightbox {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.85);
+            z-index: 3000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+        }
+        .photo-lightbox.active {
+            display: flex;
+        }
+        .photo-lightbox img {
+            max-width: 92vw;
+            max-height: 92vh;
+            object-fit: contain;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+
+        /* 右键菜单——逆地理地址行 */
+        .map-context-menu .menu-address {
+            padding: 6px 14px;
+            font-size: 12px;
+            color: #333;
+            background: #f5f9ff;
+            border-bottom: 1px solid #e1efff;
+            max-width: 260px;
+            word-break: break-all;
+            line-height: 1.5;
+        }
+        .map-context-menu .menu-address.loading {
+            color: #999;
+            font-style: italic;
+        }
+        .map-context-menu .menu-address.empty {
+            display: none;
+        }
+
+        /* ========== 测量工具栏 ========== */
+        /* 顶部居中；左右两侧分别给路径规划（左≈360）和 POI 面板（右≈380）让出空间 */
+        .measure-toolbar {
+            position: absolute;
+            top: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 950;
+            background: #fff;
+            border-radius: 6px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+            display: flex;
+            overflow: hidden;
+            font-size: 13px;
+        }
+        /* 窗口较窄时（两侧面板挤占中间），测量工具栏下沉到 POI 面板下方，避免横向重叠 */
+        @media (max-width: 1200px) {
+            .measure-toolbar {
+                top: auto;
+                left: auto;
+                transform: none;
+                right: 60px;
+                bottom: 180px;     /* 避开鹰眼 */
+            }
+        }
+        .measure-toolbar .measure-btn {
+            padding: 8px 14px;
+            border: none;
+            background: #fff;
+            cursor: pointer;
+            color: #333;
+            border-right: 1px solid #eee;
+            transition: all 0.15s;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 13px;
+        }
+        .measure-toolbar .measure-btn:last-child {
+            border-right: none;
+        }
+        .measure-toolbar .measure-btn:hover {
+            background: #f5f9ff;
+            color: #1E88E5;
+        }
+        .measure-toolbar .measure-btn.active {
+            background: #1E88E5;
+            color: #fff;
+        }
+
+        /* 测量结果浮窗 */
+        .measure-tooltip {
+            background: rgba(30, 136, 229, 0.92);
+            color: #fff;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            white-space: nowrap;
+            border: none;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.25);
+            pointer-events: none;
+        }
+        .measure-tooltip.total {
+            background: #E53935;
+            font-weight: bold;
+        }
+        .measure-tooltip.area {
+            background: #43A047;
+            font-weight: bold;
+        }
+        /* Leaflet 默认 tooltip 箭头隐藏 */
+        .leaflet-tooltip.measure-tooltip:before {
+            display: none;
+        }
+
+        /* 测量提示条 */
+        .measure-hint {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.75);
+            color: #fff;
+            padding: 8px 14px;
+            border-radius: 4px;
+            font-size: 13px;
+            z-index: 1000;
+            display: none;
+            pointer-events: none;
+        }
+        .measure-hint.active {
+            display: block;
+        }
+
+        /* ========== 鹰眼（MiniMap）========== */
+        .minimap-container {
+            position: absolute;
+            right: 12px;
+            bottom: 30px;
+            z-index: 1000;
+            width: 180px;
+            height: 140px;
+            border: 2px solid rgba(30, 136, 229, 0.8);
+            border-radius: 4px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+            background: #fff;
+            transition: all 0.2s;
+        }
+        .minimap-container.collapsed {
+            width: 32px;
+            height: 32px;
+            border-radius: 4px;
+        }
+        .minimap-container.collapsed .minimap {
+            display: none;
+        }
+        .minimap-container .minimap {
+            width: 100%;
+            height: 100%;
+        }
+        .minimap-toggle {
+            position: absolute;
+            top: 2px;
+            right: 2px;
+            width: 20px;
+            height: 20px;
+            line-height: 20px;
+            text-align: center;
+            background: rgba(255, 255, 255, 0.85);
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+            color: #555;
+            z-index: 1001;
+            user-select: none;
+        }
+        .minimap-toggle:hover { background: #fff; }
+        .minimap-container.collapsed .minimap-toggle {
+            position: static;
+            width: 100%;
+            height: 100%;
+            line-height: 28px;
+            font-size: 16px;
+            background: #fff;
+        }
+        /* 鹰眼中的"视野框" */
+        .minimap-viewport {
+            border: 2px solid #E53935;
+            background: rgba(229, 57, 53, 0.1);
+            box-sizing: border-box;
+        }
+
+        /* ========== 路况开关（图层控件内部已经有路况 overlay；这里给独立按钮样式，备用） ========== */
+        .traffic-legend {
+            position: absolute;
+            right: 12px;
+            top: 220px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 4px;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+            padding: 6px 10px;
+            font-size: 12px;
+            color: #333;
+            display: none;
+        }
+        .traffic-legend.active { display: block; }
+        .traffic-legend .legend-title {
+            font-weight: bold;
+            margin-bottom: 4px;
+            color: #555;
+        }
+        .traffic-legend .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            line-height: 1.6;
+        }
+        .traffic-legend .legend-item .bar {
+            width: 16px;
+            height: 4px;
+            border-radius: 2px;
+        }
+
+        /* ========== markercluster 自定义样式（覆盖默认配色匹配项目主题） ========== */
+        .marker-cluster-poi-small div,
+        .marker-cluster-poi-medium div,
+        .marker-cluster-poi-large div {
+            color: #fff;
+            font-weight: bold;
+        }
+        .marker-cluster-poi-small {
+            background-color: rgba(30, 136, 229, 0.55);
+        }
+        .marker-cluster-poi-small div {
+            background-color: rgba(30, 136, 229, 0.9);
+        }
+        .marker-cluster-poi-medium {
+            background-color: rgba(255, 152, 0, 0.55);
+        }
+        .marker-cluster-poi-medium div {
+            background-color: rgba(255, 152, 0, 0.9);
+        }
+        .marker-cluster-poi-large {
+            background-color: rgba(229, 57, 53, 0.55);
+        }
+        .marker-cluster-poi-large div {
+            background-color: rgba(229, 57, 53, 0.9);
+        }
     </style>
 </head>
 <body>
     <div class="map-title">Leaflet + 高德地图</div>
+
+    <!-- 路径规划面板 -->
+    <div id="route-panel" class="route-panel">
+        <div class="route-header" id="route-header">
+            <span>🛣️ 路径规划</span>
+            <span class="toggle-icon">▼</span>
+        </div>
+        <div class="route-body">
+            <div class="route-modes">
+                <button class="route-mode-btn active" data-mode="driving">🚗 驾车</button>
+                <button class="route-mode-btn" data-mode="walking">🚶 步行</button>
+                <button class="route-mode-btn" data-mode="bicycling">🚴 骑行</button>
+                <button class="route-mode-btn" data-mode="transit">🚌 公交</button>
+            </div>
+            <div class="route-cities" id="route-cities">
+                <span class="city-label">城市</span>
+                <input type="text" id="route-city" placeholder="起点城市，如 北京" />
+                <input type="text" id="route-cityd" placeholder="终点城市（跨城填）" />
+            </div>
+            <div class="route-points">
+                <div class="route-point origin">
+                    <span class="dot"></span>
+                    <span class="text clickable empty" id="route-origin-text">未选择起点（点击输入或右键地图选择）</span>
+                    <div class="route-point-input-wrap" id="route-origin-input-wrap">
+                        <input type="text" class="route-point-input" id="route-origin-input" placeholder="输入起点地名 / POI" autocomplete="off" />
+                        <div class="route-tips" id="route-origin-tips"></div>
+                    </div>
+                    <span class="clear-btn" id="route-origin-clear" title="清除起点">✕</span>
+                </div>
+                <div class="route-point destination">
+                    <span class="dot"></span>
+                    <span class="text clickable empty" id="route-destination-text">未选择终点（点击输入或右键地图选择）</span>
+                    <div class="route-point-input-wrap" id="route-destination-input-wrap">
+                        <input type="text" class="route-point-input" id="route-destination-input" placeholder="输入终点地名 / POI" autocomplete="off" />
+                        <div class="route-tips" id="route-destination-tips"></div>
+                    </div>
+                    <span class="clear-btn" id="route-destination-clear" title="清除终点">✕</span>
+                </div>
+            </div>
+            <div class="route-actions">
+                <button class="plan-btn" id="route-plan-btn">开始规划</button>
+                <button class="clear-all-btn" id="route-clear-btn">清除路径</button>
+            </div>
+            <div class="route-summary" id="route-summary"></div>
+            <div class="route-transits" id="route-transits"></div>
+            <div class="route-tip">提示：右键地图 → 选择"从这里出发"或"到这里去"</div>
+        </div>
+    </div>
+
+    <!-- 测量工具栏 -->
+    <div id="measure-toolbar" class="measure-toolbar">
+        <button id="measure-distance-btn" class="measure-btn" title="测距">📏 测距</button>
+        <button id="measure-area-btn" class="measure-btn" title="测面积">□ 测面积</button>
+        <button id="measure-clear-btn" class="measure-btn" title="清除测量">🗑 清除</button>
+    </div>
+
+    <!-- 测量提示条 -->
+    <div id="measure-hint" class="measure-hint"></div>
+
+    <!-- 地图右键菜单 -->
+    <div id="map-context-menu" class="map-context-menu">
+        <div class="menu-coord" id="menu-coord">--</div>
+        <div class="menu-address empty" id="menu-address"></div>
+        <div class="menu-item" data-action="show-address">📍 这是哪儿？</div>
+        <div class="menu-divider"></div>
+        <div class="menu-item" data-action="set-origin">🟢 从这里出发</div>
+        <div class="menu-item" data-action="set-destination">🔴 到这里去</div>
+        <div class="menu-divider"></div>
+        <div class="menu-item" data-action="copy-coord">📋 复制坐标</div>
+        <div class="menu-item" data-action="center-here">🎯 以此为中心</div>
+    </div>
+
+    <!-- POI 详情抽屉 -->
+    <div id="poi-drawer" class="poi-drawer">
+        <div class="drawer-header">
+            <div class="drawer-title">
+                <div class="name" id="drawer-name">-</div>
+                <div class="type" id="drawer-type"></div>
+            </div>
+            <div class="drawer-close" id="drawer-close" title="关闭">✕</div>
+        </div>
+        <div class="drawer-body" id="drawer-body">
+            <div class="drawer-loading">加载中...</div>
+        </div>
+        <div class="drawer-actions">
+            <button id="drawer-locate">🎯 定位</button>
+            <button id="drawer-as-origin">🟢 设为起点</button>
+            <button id="drawer-as-dest" class="primary">🔴 到这里去</button>
+        </div>
+    </div>
+
+    <!-- 图片灯箱 -->
+    <div id="photo-lightbox" class="photo-lightbox">
+        <img id="photo-lightbox-img" src="" alt="" />
+    </div>
 
     <!-- POI 搜索面板 -->
     <div class="poi-panel">
@@ -205,6 +1302,32 @@
             <button id="poi-btn">搜索</button>
             <!-- 输入联想下拉 -->
             <div id="poi-tips" class="poi-tips"></div>
+            <!-- 搜索历史 / 收藏（输入框为空且聚焦时显示） -->
+            <div id="poi-history" class="poi-history"></div>
+        </div>
+        <!-- 城市 & 范围 -->
+        <div class="poi-city-wrap">
+            <label>城市：</label>
+            <select id="poi-city">
+                <option value="">全国</option>
+                <option value="北京">北京</option>
+                <option value="上海" selected>上海</option>
+                <option value="广州">广州</option>
+                <option value="深圳">深圳</option>
+                <option value="杭州">杭州</option>
+                <option value="成都">成都</option>
+                <option value="重庆">重庆</option>
+                <option value="南京">南京</option>
+                <option value="武汉">武汉</option>
+                <option value="西安">西安</option>
+                <option value="苏州">苏州</option>
+                <option value="天津">天津</option>
+                <option value="长沙">长沙</option>
+                <option value="郑州">郑州</option>
+                <option value="青岛">青岛</option>
+                <option value="__custom__">✏️ 自定义…</option>
+            </select>
+            <button id="poi-bbox-btn" class="poi-sub-btn" title="在当前地图可视范围内搜索（更精确，忽略城市）">📍 视野内</button>
         </div>
         <!-- 分类筛选 -->
         <div class="poi-category-wrap">
@@ -234,14 +1357,26 @@
 
     <div id="map"></div>
 
-    <!-- Leaflet JS -->
-    <script
-        src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-        crossorigin=""
-    ></script>
+    <!-- 鹰眼（MiniMap） -->
+    <div id="minimap-container" class="minimap-container">
+        <div id="minimap-toggle" class="minimap-toggle" title="收起/展开鹰眼">−</div>
+        <div id="minimap" class="minimap"></div>
+    </div>
 
-    <!-- 业务脚本 -->
-    <script src="./src/main.js"></script>
+    <!-- 路况图例（勾选路况图层时显示） -->
+    <div id="traffic-legend" class="traffic-legend">
+        <div class="legend-title">🚦 实时路况</div>
+        <div class="legend-item"><span class="bar" style="background:#2ECC71;"></span>畅通</div>
+        <div class="legend-item"><span class="bar" style="background:#F1C40F;"></span>缓行</div>
+        <div class="legend-item"><span class="bar" style="background:#E67E22;"></span>拥堵</div>
+        <div class="legend-item"><span class="bar" style="background:#C0392B;"></span>严重拥堵</div>
+    </div>
+
+    <!--
+        业务入口（ES Module）
+        Leaflet 及其插件的 CSS/JS 都在 main.js 里用 ES import 引入，Vite 会自动打包。
+        AMAP_WEB_KEY 来自 .env.local 中的 VITE_AMAP_WEB_KEY（见 src/config.js）。
+    -->
+    <script type="module" src="/src/main.js"></script>
 </body>
 </html>
