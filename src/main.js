@@ -6660,6 +6660,246 @@ let navLastSpeed = 0;                     // 最近一次速度（m/s），用�
 let navMaxHistory = 30;                   // localStorage 最多保留多少条记录
 const NAV_HISTORY_KEY = 'leaflet_demo_nav_history_v1';
 
+// ======= 套餐 1：语音 / 第一视角 / 倒计时 / 途经点 / 音效 =======
+let navVoiceOn      = true;                  // A1 语音播报开关
+let navVoiceLastKey = '';                    // 同一句话避免反复播
+let navVoiceLastAt  = 0;                     // 上次播报时间戳
+const NAV_VOICE_PREF_KEY = 'leaflet_demo_nav_voice_on_v1';
+
+let navFpvOn        = false;                 // A2 第一视角（地图反向旋转）
+let navMapPaneEl    = null;                  // 缓存地图 pane
+let navFpvLastBearing = 0;                   // 上次旋转角，做插值
+let navArrivalActive = false;                // A4 倒计时遮罩是否已亮
+const NAV_ARRIVAL_THRESHOLD = 200;           // m，进入此距离触发"即将到达"
+
+// B6 途经点提示：记录沿路径前进时每个 waypoint 距起点的累计米数与是否提示过
+let navWpCheckpoints = [];                   // [{ idx, dist, name, hit:boolean }]
+
+// ============================== 工具函数（新增） ==============================
+
+/* ---------- A1 / B6 语音播报 ---------- */
+function navSpeak(text, opts = {}) {
+    if (!navVoiceOn) return;
+    if (!('speechSynthesis' in window)) return;
+    const now = Date.now();
+    const key = (opts.key || text);
+    // 同一句话 6 秒内不重复
+    if (key === navVoiceLastKey && (now - navVoiceLastAt) < 6000 && !opts.force) return;
+    navVoiceLastKey = key;
+    navVoiceLastAt  = now;
+    try {
+        // 紧急播报先停掉队列
+        if (opts.urgent) window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = 'zh-CN';
+        u.rate = opts.rate || 1.05;
+        u.pitch = 1.0;
+        u.volume = 1.0;
+        window.speechSynthesis.speak(u);
+    } catch (e) { /* 忽略 */ }
+}
+function navStopSpeak() {
+    try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (_) {}
+}
+
+/* ---------- B5 音效（DataURI WAV，无需外部资源） ----------
+   两段轻量级合成音：到达成功（双音上扬）/ 途经点叮咚 */
+const NAV_SFX_ARRIVE = (() => {
+    // 用 WebAudio 实时合成，比内嵌 dataURL 体积小很多
+    return function() {
+        try {
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) return;
+            const ctx = new Ctx();
+            const now = ctx.currentTime;
+            const notes = [
+                { f: 660,  t: 0.00, d: 0.18 },
+                { f: 880,  t: 0.18, d: 0.18 },
+                { f: 1175, t: 0.36, d: 0.32 }
+            ];
+            notes.forEach(n => {
+                const osc = ctx.createOscillator();
+                const g = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.value = n.f;
+                osc.connect(g); g.connect(ctx.destination);
+                g.gain.setValueAtTime(0.0001, now + n.t);
+                g.gain.exponentialRampToValueAtTime(0.35, now + n.t + 0.02);
+                g.gain.exponentialRampToValueAtTime(0.0001, now + n.t + n.d);
+                osc.start(now + n.t);
+                osc.stop(now + n.t + n.d + 0.02);
+            });
+            setTimeout(() => { try { ctx.close(); } catch(_) {} }, 1200);
+        } catch (_) {}
+    };
+})();
+const NAV_SFX_DING = (() => {
+    return function() {
+        try {
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) return;
+            const ctx = new Ctx();
+            const now = ctx.currentTime;
+            [{ f: 988, t: 0, d: 0.16 }, { f: 1318, t: 0.12, d: 0.22 }].forEach(n => {
+                const osc = ctx.createOscillator();
+                const g = ctx.createGain();
+                osc.type = 'triangle';
+                osc.frequency.value = n.f;
+                osc.connect(g); g.connect(ctx.destination);
+                g.gain.setValueAtTime(0.0001, now + n.t);
+                g.gain.exponentialRampToValueAtTime(0.25, now + n.t + 0.01);
+                g.gain.exponentialRampToValueAtTime(0.0001, now + n.t + n.d);
+                osc.start(now + n.t);
+                osc.stop(now + n.t + n.d + 0.02);
+            });
+            setTimeout(() => { try { ctx.close(); } catch(_) {} }, 800);
+        } catch (_) {}
+    };
+})();
+
+/* ---------- A2 第一视角：旋转瓦片层 + 矢量层，让前进方向朝屏幕上方 ----------
+   注意：只旋转 tile-pane / overlay-pane，不旋转 marker-pane，
+   以避免破坏 Leaflet 的坐标系统（marker 位置由 left/top 控制，旋转外层会漂位）。
+   这种"伪 3D"旋转视觉上 = 真实车机第一视角。 */
+function navGetRotPanes() {
+    return [
+        document.querySelector('.leaflet-tile-pane'),
+        document.querySelector('.leaflet-overlay-pane')
+    ].filter(Boolean);
+}
+function navApplyFpvRotation(bearing) {
+    if (!navFpvOn) return;
+    const panes = navGetRotPanes();
+    if (!panes.length) return;
+    // 平滑：与上次角度做最短路径插值
+    let target = bearing;
+    let diff = ((target - navFpvLastBearing + 540) % 360) - 180;
+    target = navFpvLastBearing + diff;
+    navFpvLastBearing = target;
+    // 让"前方"朝上 → 整体旋转 -bearing
+    panes.forEach(p => {
+        p.style.transformOrigin = '50% 50%';
+        p.style.transition = 'transform 0.45s ease-out';
+        // pane 自身已有 leaflet 的 translate3d，需保留：直接写 rotate 会被覆盖前缀
+        // 但 leaflet 的 translate 写在 .leaflet-pane 的 inline style 上，我们追加 rotate
+        // 做法：用 CSS 变量叠加。这里改用 wrapper 方式更稳——直接给 pane 设置 rotate，
+        // leaflet 自身的 translate 在子元素上，pane 元素是干净容器，可放心 rotate。
+        // 实测：Leaflet 把 translate3d 设在 .leaflet-tile-container 等子节点上，pane 元素本身没有 transform。
+        p.style.transform = `rotate(${-target}deg)`;
+    });
+    // 箭头 marker 反向旋转，让箭头持续朝屏幕上方（视觉=车头朝前）
+    if (navArrowMarker) {
+        const el = navArrowMarker.getElement();
+        if (el) {
+            const inner = el.querySelector('div');
+            if (inner) inner.style.transform = `rotate(0deg)`; // 箭头朝上
+        }
+    }
+}
+function navResetFpvRotation() {
+    const panes = [
+        document.querySelector('.leaflet-tile-pane'),
+        document.querySelector('.leaflet-overlay-pane')
+    ].filter(Boolean);
+    panes.forEach(p => {
+        p.style.transform = '';
+        p.style.transformOrigin = '';
+        p.style.transition = '';
+    });
+    navFpvLastBearing = 0;
+    // 恢复箭头按 bearing 旋转（由 updateArrowMarker 下次更新时重置）
+}
+
+/* ---------- B6 途经点：把 routeWaypoints 投影到当前路径上，得到沿路距离 ---------- */
+function navBuildWpCheckpoints() {
+    navWpCheckpoints = [];
+    if (!Array.isArray(window.routeWaypoints) || routeWaypoints.length === 0) return;
+    routeWaypoints.forEach((wp, i) => {
+        if (!wp) return;
+        const proj = navProjectOnPolyline([wp.lat, wp.lng], navCoords);
+        if (!proj) return;
+        navWpCheckpoints.push({
+            idx: i + 1,
+            dist: proj.traveled,
+            name: wp.name || ('途经点 ' + (i + 1)),
+            hit: false
+        });
+    });
+    navWpCheckpoints.sort((a, b) => a.dist - b.dist);
+}
+
+function navShowWpToast(text) {
+    const el = document.getElementById('nav-wp-toast');
+    if (!el) return;
+    el.textContent = text;
+    el.classList.remove('active');
+    // 强制重启动画
+    void el.offsetWidth;
+    el.classList.add('active');
+    setTimeout(() => el.classList.remove('active'), 3500);
+}
+
+/* ---------- A4 倒计时遮罩 ---------- */
+function navShowArrivalBanner(remainM) {
+    const el = document.getElementById('nav-arrival-banner');
+    const distEl = document.getElementById('nav-arrival-dist');
+    if (!el) return;
+    if (distEl) distEl.textContent = navFmtDist(remainM);
+    if (!navArrivalActive) {
+        el.classList.add('active');
+        navArrivalActive = true;
+    }
+}
+function navHideArrivalBanner() {
+    const el = document.getElementById('nav-arrival-banner');
+    if (el) el.classList.remove('active');
+    navArrivalActive = false;
+}
+
+/* ---------- A3 完成回顾：把整条路径生成等比 SVG 缩略图 ---------- */
+function navBuildRecapSvg(coords, walkedM) {
+    if (!coords || coords.length < 2) return '';
+    const W = 360, H = 130, PAD = 12;
+    let minLat = Infinity, maxLat = -Infinity;
+    let minLng = Infinity, maxLng = -Infinity;
+    coords.forEach(([lat, lng]) => {
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+        if (lng < minLng) minLng = lng;
+        if (lng > maxLng) maxLng = lng;
+    });
+    const latRange = Math.max(1e-6, maxLat - minLat);
+    const lngRange = Math.max(1e-6, maxLng - minLng);
+    const innerW = W - PAD * 2, innerH = H - PAD * 2;
+    // 保比缩放
+    const scale = Math.min(innerW / lngRange, innerH / latRange);
+    const offX  = PAD + (innerW - lngRange * scale) / 2;
+    const offY  = PAD + (innerH - latRange * scale) / 2;
+    const proj = ([lat, lng]) => [
+        offX + (lng - minLng) * scale,
+        offY + (maxLat - lat) * scale  // y 翻转
+    ];
+    const points = coords.map(proj);
+    const pathD = points.map((p, i) => (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ');
+    const start = points[0];
+    const end   = points[points.length - 1];
+    return `
+<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="recapBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#eef3fa"/>
+      <stop offset="100%" stop-color="#dde6f3"/>
+    </linearGradient>
+  </defs>
+  <rect width="${W}" height="${H}" fill="url(#recapBg)"/>
+  <path d="${pathD}" fill="none" stroke="#1E88E5" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="${start[0].toFixed(1)}" cy="${start[1].toFixed(1)}" r="6" fill="#43A047" stroke="#fff" stroke-width="2"/>
+  <circle cx="${end[0].toFixed(1)}"   cy="${end[1].toFixed(1)}"   r="6" fill="#E53935" stroke="#fff" stroke-width="2"/>
+  <text x="${start[0].toFixed(1)}" y="${(start[1]-10).toFixed(1)}" font-size="11" text-anchor="middle" fill="#2E7D32" font-weight="600">起</text>
+  <text x="${end[0].toFixed(1)}"   y="${(end[1]-10).toFixed(1)}"   font-size="11" text-anchor="middle" fill="#C62828" font-weight="600">终</text>
+</svg>`;
+}
+
 // -------------------- 工具函数 --------------------
 
 // 米制 Haversine（Leaflet 自带 distance 走的是 Vincenty 形式，平面应用上等价；这里复用）
@@ -6913,6 +7153,25 @@ function startNavigation(mode) {
     document.getElementById('nav-hud-sim-row').classList.toggle('active', mode === 'sim');
     syncSimSpeedSlider();
 
+    // 重置套餐 1 状态
+    navVoiceLastKey = '';
+    navVoiceLastAt  = 0;
+    navStopSpeak();
+    navArrivalActive = false;
+    navHideArrivalBanner();
+    navResetFpvRotation();
+    navFpvOn = false;
+    document.body.classList.remove('nav-fpv');
+    const fpvBtn = document.getElementById('nav-hud-fpv');
+    if (fpvBtn) fpvBtn.textContent = '🧭 平视';
+    // 读语音偏好
+    try {
+        const pref = localStorage.getItem(NAV_VOICE_PREF_KEY);
+        if (pref === '0') navVoiceOn = false; else navVoiceOn = true;
+    } catch (_) { navVoiceOn = true; }
+    const voiceBtn = document.getElementById('nav-hud-voice');
+    if (voiceBtn) voiceBtn.textContent = navVoiceOn ? '🔊 语音' : '🔇 静音';
+
     // 替换为"已走/待行"双线 + 隐藏蚂蚁线
     setupNavLayers();
 
@@ -6935,6 +7194,19 @@ function startNavigation(mode) {
 
     // 通用事件绑定（首次）
     bindHudControlsOnce();
+
+    // 套餐 1：B6 途经点索引
+    navBuildWpCheckpoints();
+
+    // 套餐 1：开始语音
+    const transportName = ({ bicycling: '骑行', walking: '步行', driving: '驾车' })[navTransport] || '导航';
+    navSpeak((mode === 'sim' ? '模拟' : '实时') + transportName + '已开始，全程约 ' + navFmtDist(navTotalDist) + '，请注意安全', { force: true });
+
+    // ⭐ 超级增强 hook：开始时初始化（金币/挑战/速度采样/POI/天气/流光等）
+    if (typeof navFxOnStart === 'function') {
+        try { navFxOnStart({ mode, transport: navTransport, coords: navCoords, totalDist: navTotalDist, dest: navDestInfo }); }
+        catch (e) { console.warn('[navFx] start hook 错误', e); }
+    }
 
     showToast(mode === 'sim'
         ? '🎮 模拟导航已启动 — 调节速度滑块体验'
@@ -7112,8 +7384,39 @@ function advanceNav(userLatLng, forceWalked) {
         map.panTo(navCurLatLng, { animate: true, duration: 0.4 });
     }
 
+    // A2 第一视角：底图反向旋转，让前进方向始终朝上
+    if (navFpvOn) navApplyFpvRotation(bearing);
+
     // HUD 更新
     updateHud(traveled, bearing);
+
+    // ⭐ 超级增强 hook：每帧推进（金币吸收/POI检测/速度采样/挑战倒计时/流光更新）
+    if (typeof navFxOnAdvance === 'function') {
+        try { navFxOnAdvance({ traveled, bearing, latlng: navCurLatLng, speed: navLastSpeed }); }
+        catch (e) { /* 静默 */ }
+    }
+
+    // B6 途经点提示
+    if (navWpCheckpoints.length) {
+        navWpCheckpoints.forEach(wp => {
+            if (wp.hit) return;
+            // 走过该途经点上游 ~30m 时提醒
+            if (traveled >= wp.dist - 30) {
+                wp.hit = true;
+                navShowWpToast(`📍 已靠近途经点 ${wp.idx}：${wp.name}`);
+                navSpeak(`已到达途经点${wp.idx}，${wp.name}`, { key: 'wp_' + wp.idx });
+                NAV_SFX_DING();
+            }
+        });
+    }
+
+    // A4 到达倒计时（进入 200m 以内开始脉冲，退出则隐藏）
+    const remainMNow = navTotalDist - traveled;
+    if (remainMNow <= NAV_ARRIVAL_THRESHOLD && remainMNow > 5) {
+        navShowArrivalBanner(remainMNow);
+    } else if (remainMNow > NAV_ARRIVAL_THRESHOLD && navArrivalActive) {
+        navHideArrivalBanner();
+    }
 
     // 到达检测
     const remain = navTotalDist - traveled;
@@ -7179,6 +7482,25 @@ function updateHud(traveled, bearing) {
         turnText = `即将到达终点（${navFmtDist(remain)}）`;
     }
 
+    // A1 语音播报：在关键距离阈值处读一句
+    if (turn) {
+        const t2 = navTurnToEmoji(turn.turnAngle);
+        const da = turn.distAhead;
+        // 阈值梯度：~500m / ~200m / ~80m
+        let bucket = null;
+        if (da > 380 && da < 520)      bucket = '500m';
+        else if (da > 150 && da < 250) bucket = '200m';
+        else if (da > 50  && da < 100) bucket = '80m';
+        if (bucket) {
+            navSpeak(`前方 ${navFmtDist(da)} 后${t2.text}`,
+                { key: 'turn_' + turn.turnAngle.toFixed(0) + '_' + bucket });
+        }
+    }
+    // 接近终点语音（仅说一次）
+    if (remain > 80 && remain < 200) {
+        navSpeak('前方 200 米即将到达终点', { key: 'arrival_200' });
+    }
+
     const $ = (id) => document.getElementById(id);
     $('nav-hud-turn-icon').textContent  = turnIcon;
     $('nav-hud-turn-text').textContent  = turnText;
@@ -7220,6 +7542,33 @@ function bindHudControlsOnce() {
     document.getElementById('nav-hud-stop').addEventListener('click', () => {
         if (confirm('确定要结束当前导航吗？')) stopNavigation();
     });
+
+    // 套餐 1：语音切换
+    const voiceBtn = document.getElementById('nav-hud-voice');
+    if (voiceBtn) {
+        voiceBtn.addEventListener('click', () => {
+            navVoiceOn = !navVoiceOn;
+            voiceBtn.textContent = navVoiceOn ? '🔊 语音' : '🔇 静音';
+            try { localStorage.setItem(NAV_VOICE_PREF_KEY, navVoiceOn ? '1' : '0'); } catch (_) {}
+            if (!navVoiceOn) navStopSpeak();
+            else navSpeak('已开启语音播报', { force: true });
+        });
+    }
+
+    // 套餐 1：第一视角切换
+    const fpvBtn = document.getElementById('nav-hud-fpv');
+    if (fpvBtn) {
+        fpvBtn.addEventListener('click', () => {
+            navFpvOn = !navFpvOn;
+            fpvBtn.textContent = navFpvOn ? '🧭 车载' : '🧭 平视';
+            document.body.classList.toggle('nav-fpv', navFpvOn);
+            if (!navFpvOn) navResetFpvRotation();
+            else if (navCurLatLng) {
+                navApplyFpvRotation(navBearingAt(navCoords, navWalkedDist));
+            }
+            showToast(navFpvOn ? '🧭 车载视角已开启' : '🧭 平视角已恢复', 'info');
+        });
+    }
 
     // 模拟速度滑块
     const slider = document.getElementById('nav-hud-sim-speed');
@@ -7268,7 +7617,20 @@ function stopNavigation(opts = {}) {
     if (navOffroutePoly) { try { map.removeLayer(navOffroutePoly); } catch(_) {} navOffroutePoly = null; }
     if (navArrowMarker)  { try { map.removeLayer(navArrowMarker);  } catch(_) {} navArrowMarker  = null; }
 
+    // 套餐 1 清理
+    navStopSpeak();
+    navHideArrivalBanner();
+    navResetFpvRotation();
+    document.body.classList.remove('nav-fpv');
+    navFpvOn = false;
+    navWpCheckpoints = [];
+
     showNavHud(false);
+
+    // ⭐ 超级增强 hook：结束时清理（移除金币/POI 提示/挑战定时器/流光样式等）
+    if (typeof navFxOnStop === 'function') {
+        try { navFxOnStop(); } catch (e) { /* 静默 */ }
+    }
 
     if (wasRunning && !opts.silent) {
         showToast('⏹ 已结束导航', 'info');
@@ -7306,7 +7668,23 @@ function finishNavigation() {
     })[navTransport] || '导航';
     $('nav-finish-title').textContent =
         (navMode === 'sim' ? '🎮 模拟' : '🎉 实时') + transportLabel + '完成！';
+
+    // A3 路径回顾缩略图
+    const recapEl = document.getElementById('nav-finish-recap');
+    if (recapEl) recapEl.innerHTML = navBuildRecapSvg(navCoords, navWalkedDist);
+
+    // ⭐ 超级增强 hook：完成时（速度曲线/成就检测/历史热力扩展）
+    if (typeof navFxOnFinish === 'function') {
+        try { navFxOnFinish({ distance: dist, duration: elapsedSec, avgSpeed, maxSpeed: navMaxSpeed, coords: navCoords }); }
+        catch (e) { console.warn('[navFx] finish hook 错误', e); }
+    }
+
     $('nav-finish-mask').classList.add('active');
+
+    // B5 完成音效 + A1 语音恭喜
+    NAV_SFX_ARRIVE();
+    navSpeak(`恭喜到达终点，本次${transportLabel}全程 ${navFmtDist(dist)}，用时 ${navFmtDur(elapsedSec)}`,
+        { force: true, urgent: true });
 
     // 停掉
     stopNavigation({ silent: true });
@@ -7420,3 +7798,838 @@ function renderNavHistoryDrawer() {
         showToast('🗑 已清空全部记录', 'info');
     });
 }
+
+
+// ============================================================================
+//   ⭐⭐⭐  超级导航增强模块（套餐 ABCD 一次到位）
+//
+//   覆盖功能：
+//     V1 路径流光       V2 粒子尾迹     V3 时段滤镜     V4 天气特效层
+//     G1 金币模式       G3 限时挑战     G4 成就系统     G5 随机冒险
+//     R1 沿途 POI       R3 实时天气
+//     D1 速度曲线       D3 历史热力图   D4 GPX 导出
+//
+//   这一坨完全独立挂在 main.js 末尾，通过 navFxOnStart / navFxOnAdvance /
+//   navFxOnFinish / navFxOnStop 四个 hook 接入主导航流程，
+//   不污染原有变量名空间。
+// ============================================================================
+(function () {
+    if (typeof map === 'undefined' || typeof L === 'undefined') return;
+
+    // ---- 状态 ----
+    const fx = {
+        // 视觉
+        timeMode: 'day',          // day | dusk | night
+        weatherMode: 'clear',     // clear | rain | snow | fog
+        glowOn: true,
+        particleTimer: null,
+        particleNodes: [],
+        // 游戏
+        coinModeOn: false,
+        coins: [],                // [{ marker, dist, picked }]
+        score: 0,
+        challengeOn: false,
+        challengeDeadline: 0,
+        challengeTimer: null,
+        // 数据
+        speedSamples: [],         // [{ d, v }]
+        lastSampleAt: 0,
+        // POI
+        poiSeen: new Set(),
+        poiCache: [],             // 沿路 POI 缓存
+        poiTimer: null,
+        // 天气
+        weatherChip: '🌤 --',
+        weatherTimer: null,
+        // 热力图
+        heatLayer: null,
+        heatOn: false,
+    };
+
+    const STORE_KEYS = {
+        ACHIEVEMENTS: 'leaflet_demo_nav_achv_v1',
+        TOTAL_DIST:   'leaflet_demo_nav_total_v1',
+        TOTAL_RUNS:   'leaflet_demo_nav_runs_v1',
+    };
+
+    // ============================================================
+    //   工具：DOM / 通知
+    // ============================================================
+    const $ = (id) => document.getElementById(id);
+
+    function showAchievement(ico, title, desc) {
+        const box = $('nav-achv-toast');
+        if (!box) return;
+        $('nav-achv-ico').textContent = ico;
+        $('nav-achv-tt').textContent  = title;
+        $('nav-achv-ds').textContent  = desc;
+        box.classList.add('active');
+        try { (typeof NAV_SFX_DING === 'function') && NAV_SFX_DING(); } catch(_) {}
+        clearTimeout(showAchievement._t);
+        showAchievement._t = setTimeout(() => box.classList.remove('active'), 4000);
+    }
+
+    function popupCoinText(txt) {
+        const div = document.createElement('div');
+        div.className = 'nav-coin-pop';
+        div.textContent = txt;
+        document.body.appendChild(div);
+        setTimeout(() => { try { div.remove(); } catch(_) {} }, 1000);
+    }
+
+    // ============================================================
+    //   V3 时段滤镜
+    // ============================================================
+    function setTimeMode(mode) {
+        fx.timeMode = mode;
+        document.body.classList.remove('nav-time-dusk', 'nav-time-night');
+        if (mode === 'dusk')  document.body.classList.add('nav-time-dusk');
+        if (mode === 'night') document.body.classList.add('nav-time-night');
+        const btn = $('nav-fx-time');
+        if (btn) {
+            btn.textContent = mode === 'day' ? '🌞 白天' : (mode === 'dusk' ? '🌆 黄昏' : '🌃 夜晚');
+        }
+    }
+
+    // ============================================================
+    //   V4 天气特效层（雨/雪/雾，纯 DOM 粒子）
+    // ============================================================
+    function setWeatherMode(mode) {
+        fx.weatherMode = mode;
+        const layer = $('nav-fx-layer');
+        if (!layer) return;
+        layer.classList.remove('active', 'fog');
+        layer.innerHTML = '';
+        const btn = $('nav-fx-weather');
+        const map = { clear: '☀️ 晴', rain: '🌧 雨', snow: '❄️ 雪', fog: '🌫 雾' };
+        if (btn) btn.textContent = map[mode] || '☀️ 晴';
+
+        if (mode === 'clear') return;
+        layer.classList.add('active');
+        if (mode === 'fog') {
+            layer.classList.add('fog');
+            return;
+        }
+        const N = mode === 'rain' ? 110 : 70;
+        const cls = mode === 'rain' ? 'drop' : 'snow';
+        const frag = document.createDocumentFragment();
+        for (let i = 0; i < N; i++) {
+            const d = document.createElement('div');
+            d.className = cls;
+            d.style.left = (Math.random() * 100) + '%';
+            d.style.animationDelay = (Math.random() * (mode === 'rain' ? 0.9 : 6)) + 's';
+            d.style.animationDuration = mode === 'rain'
+                ? (0.6 + Math.random() * 0.6) + 's'
+                : (4 + Math.random() * 4)   + 's';
+            if (mode === 'rain') d.style.opacity = (0.5 + Math.random() * 0.5).toFixed(2);
+            frag.appendChild(d);
+        }
+        layer.appendChild(frag);
+    }
+
+    // ============================================================
+    //   V1 路径流光（在 navAheadLine 的 SVG path 上加 dasharray 类）
+    // ============================================================
+    function applyGlowToAhead() {
+        if (!fx.glowOn) return;
+        // 等 leaflet 把 polyline 渲染出 svg 节点
+        setTimeout(() => {
+            try {
+                if (typeof navAheadLine === 'undefined' || !navAheadLine) return;
+                const el = navAheadLine.getElement && navAheadLine.getElement();
+                if (el) el.classList.add('nav-glow-walked');
+            } catch (_) {}
+        }, 60);
+    }
+    function toggleGlow() {
+        fx.glowOn = !fx.glowOn;
+        const btn = $('nav-fx-glow');
+        if (btn) btn.textContent = fx.glowOn ? '🌈 流光 ON' : '🌈 流光 OFF';
+        try {
+            if (typeof navAheadLine !== 'undefined' && navAheadLine) {
+                const el = navAheadLine.getElement && navAheadLine.getElement();
+                if (el) el.classList.toggle('nav-glow-walked', fx.glowOn);
+            }
+        } catch (_) {}
+    }
+
+    // ============================================================
+    //   V2 粒子尾迹：在箭头 marker 当前位置周期性投放小圆点
+    // ============================================================
+    function startParticleTrail() {
+        stopParticleTrail();
+        fx.particleTimer = setInterval(() => {
+            try {
+                if (typeof navArrowMarker === 'undefined' || !navArrowMarker) return;
+                const ll = navArrowMarker.getLatLng();
+                const c = L.circleMarker(ll, {
+                    radius: 5, color: '#ffd54f', weight: 0,
+                    fillColor: '#ffd54f', fillOpacity: 0.85,
+                    interactive: false
+                }).addTo(map);
+                fx.particleNodes.push(c);
+                // 渐隐
+                let r = 5, op = 0.85;
+                const fade = setInterval(() => {
+                    r -= 0.4; op -= 0.07;
+                    if (op <= 0 || r <= 0) {
+                        try { map.removeLayer(c); } catch (_) {}
+                        clearInterval(fade);
+                        const i = fx.particleNodes.indexOf(c);
+                        if (i >= 0) fx.particleNodes.splice(i, 1);
+                        return;
+                    }
+                    c.setRadius(Math.max(0.5, r));
+                    c.setStyle({ fillOpacity: op });
+                }, 80);
+            } catch (_) {}
+        }, 280);
+    }
+    function stopParticleTrail() {
+        if (fx.particleTimer) { clearInterval(fx.particleTimer); fx.particleTimer = null; }
+        fx.particleNodes.slice().forEach(n => { try { map.removeLayer(n); } catch (_) {} });
+        fx.particleNodes = [];
+    }
+
+    // ============================================================
+    //   G1 金币模式：随机沿路撒 8 枚金币
+    // ============================================================
+    function spawnCoins(coords, totalDist) {
+        clearCoins();
+        if (!coords || coords.length < 2 || totalDist < 200) return;
+        const N = Math.min(10, Math.max(5, Math.round(totalDist / 800)));
+        for (let i = 0; i < N; i++) {
+            // 均匀偏置 + 随机扰动
+            const ratio = (i + 0.5) / N + (Math.random() - 0.5) * 0.05;
+            const d = Math.max(80, Math.min(totalDist - 30, totalDist * ratio));
+            const ll = sampleLatLngAt(coords, d);
+            if (!ll) continue;
+            const value = (Math.random() < 0.15) ? 50 : (Math.random() < 0.5 ? 10 : 20);
+            const icon = L.divIcon({
+                className: '',
+                html: `<div class="nav-coin-icon">${value}</div>`,
+                iconSize: [26, 26], iconAnchor: [13, 13]
+            });
+            const m = L.marker(ll, { icon, zIndexOffset: 1500, interactive: false }).addTo(map);
+            fx.coins.push({ marker: m, dist: d, value, picked: false });
+        }
+    }
+    function clearCoins() {
+        fx.coins.forEach(c => { try { map.removeLayer(c.marker); } catch (_) {} });
+        fx.coins = [];
+        fx.score = 0;
+        const chip = $('nav-hud-score');
+        if (chip) chip.textContent = '🪙 0';
+    }
+    function checkCoinPick(traveled) {
+        if (!fx.coinModeOn) return;
+        fx.coins.forEach(c => {
+            if (c.picked) return;
+            // 越过该距离即吃到
+            if (traveled >= c.dist - 5) {
+                c.picked = true;
+                fx.score += c.value;
+                try { map.removeLayer(c.marker); } catch (_) {}
+                popupCoinText('+' + c.value);
+                try { (typeof NAV_SFX_DING === 'function') && NAV_SFX_DING(); } catch (_) {}
+                const chip = $('nav-hud-score');
+                if (chip) chip.textContent = '🪙 ' + fx.score;
+            }
+        });
+    }
+    function toggleCoinMode() {
+        fx.coinModeOn = !fx.coinModeOn;
+        const btn = $('nav-fx-coin');
+        if (btn) btn.textContent = '🪙 金币 ' + (fx.coinModeOn ? 'ON' : 'OFF');
+        showToast(fx.coinModeOn ? '🪙 金币模式开启 — 下次导航会撒金币' : '🪙 金币模式关闭', 'info');
+        // 若正在导航中，立刻撒
+        if (fx.coinModeOn && typeof navState !== 'undefined' && navState === 'RUNNING'
+            && typeof navCoords !== 'undefined' && navCoords) {
+            spawnCoins(navCoords, navTotalDist);
+        } else if (!fx.coinModeOn) {
+            clearCoins();
+        }
+    }
+
+    // ============================================================
+    //   G3 限时挑战
+    // ============================================================
+    function toggleChallenge() {
+        if (fx.challengeOn) {
+            stopChallenge();
+            return;
+        }
+        const minutesStr = prompt('⏰ 限时挑战\n请输入目标用时（分钟），导航中实时倒计时：', '20');
+        if (!minutesStr) return;
+        const m = parseFloat(minutesStr);
+        if (!m || m <= 0) { alert('请输入正确的分钟数'); return; }
+        fx.challengeOn = true;
+        fx.challengeDeadline = Date.now() + m * 60 * 1000;
+        const chip = $('nav-hud-challenge');
+        if (chip) chip.style.display = '';
+        const btn = $('nav-fx-challenge');
+        if (btn) btn.textContent = '🎯 挑战 ON';
+        startChallengeTick();
+        showToast(`🎯 限时挑战已设：${m} 分钟`, 'info');
+    }
+    function startChallengeTick() {
+        if (fx.challengeTimer) clearInterval(fx.challengeTimer);
+        fx.challengeTimer = setInterval(() => {
+            const chip = $('nav-hud-challenge');
+            if (!chip) return;
+            const left = fx.challengeDeadline - Date.now();
+            if (left <= 0) {
+                chip.classList.remove('warn');
+                chip.classList.add('danger');
+                chip.textContent = '⏰ 超时';
+                return;
+            }
+            const sec = Math.floor(left / 1000);
+            const mm = Math.floor(sec / 60), ss = sec % 60;
+            chip.classList.toggle('warn', sec < 120);
+            chip.classList.toggle('danger', sec < 30);
+            chip.textContent = '⏰ ' + mm + ':' + String(ss).padStart(2, '0');
+        }, 500);
+    }
+    function stopChallenge() {
+        fx.challengeOn = false;
+        if (fx.challengeTimer) { clearInterval(fx.challengeTimer); fx.challengeTimer = null; }
+        const chip = $('nav-hud-challenge');
+        if (chip) { chip.style.display = 'none'; chip.classList.remove('warn', 'danger'); }
+        const btn = $('nav-fx-challenge');
+        if (btn) btn.textContent = '🎯 挑战 OFF';
+    }
+
+    // ============================================================
+    //   G4 成就系统
+    // ============================================================
+    const ACHIEVEMENTS = [
+        { id: 'first_run',    ico: '🎉', title: '首次完赛',       desc: '完成第一次导航',           cond: (s) => s.totalRuns >= 1 },
+        { id: 'run_5',        ico: '🥉', title: '勤奋骑士',       desc: '累计完成 5 次导航',         cond: (s) => s.totalRuns >= 5 },
+        { id: 'run_20',       ico: '🥇', title: '老司机',         desc: '累计完成 20 次导航',        cond: (s) => s.totalRuns >= 20 },
+        { id: 'dist_10km',    ico: '📏', title: '10 公里俱乐部',   desc: '累计行驶 10 km',           cond: (s) => s.totalDist >= 10000 },
+        { id: 'dist_100km',   ico: '🚀', title: '百公里达成',      desc: '累计行驶 100 km',          cond: (s) => s.totalDist >= 100000 },
+        { id: 'speed_30',     ico: '⚡', title: '风一样的男子',    desc: '单次最高速度 ≥ 30 km/h',    cond: (s, last) => last && last.maxSpeed >= 30/3.6 },
+        { id: 'long_5km',     ico: '🌅', title: '远行者',          desc: '单次距离 ≥ 5 km',           cond: (s, last) => last && last.distance >= 5000 },
+        { id: 'coin_100',     ico: '🪙', title: '财富自由',        desc: '单次得分 ≥ 100',           cond: (s, last) => last && last.score >= 100 },
+        { id: 'time_under',   ico: '🎯', title: '挑战达人',        desc: '在限时挑战内完成',          cond: (s, last) => last && last.challengeWon },
+    ];
+    function loadAchievements() {
+        try { return JSON.parse(localStorage.getItem(STORE_KEYS.ACHIEVEMENTS) || '[]'); }
+        catch (_) { return []; }
+    }
+    function saveAchievements(arr) {
+        try { localStorage.setItem(STORE_KEYS.ACHIEVEMENTS, JSON.stringify(arr)); } catch (_) {}
+    }
+    function addCumStats(distance) {
+        try {
+            const td = parseInt(localStorage.getItem(STORE_KEYS.TOTAL_DIST) || '0', 10) + (distance || 0);
+            const tr = parseInt(localStorage.getItem(STORE_KEYS.TOTAL_RUNS) || '0', 10) + 1;
+            localStorage.setItem(STORE_KEYS.TOTAL_DIST, String(td));
+            localStorage.setItem(STORE_KEYS.TOTAL_RUNS, String(tr));
+            return { totalDist: td, totalRuns: tr };
+        } catch (_) {
+            return { totalDist: distance || 0, totalRuns: 1 };
+        }
+    }
+    function checkAchievements(last) {
+        const got = new Set(loadAchievements());
+        let totalDist = 0, totalRuns = 0;
+        try {
+            totalDist = parseInt(localStorage.getItem(STORE_KEYS.TOTAL_DIST) || '0', 10);
+            totalRuns = parseInt(localStorage.getItem(STORE_KEYS.TOTAL_RUNS) || '0', 10);
+        } catch (_) {}
+        const stats = { totalDist, totalRuns };
+        const newly = [];
+        ACHIEVEMENTS.forEach(a => {
+            if (got.has(a.id)) return;
+            try { if (a.cond(stats, last)) newly.push(a); }
+            catch (_) {}
+        });
+        newly.forEach(a => got.add(a.id));
+        saveAchievements(Array.from(got));
+        // 依次弹出（错峰 1.5s）
+        newly.forEach((a, i) => {
+            setTimeout(() => showAchievement(a.ico, '🏆 解锁：' + a.title, a.desc), 1500 + i * 1800);
+        });
+        return newly;
+    }
+    function openAchievementsModal() {
+        const got = new Set(loadAchievements());
+        const totalDist = parseInt(localStorage.getItem(STORE_KEYS.TOTAL_DIST) || '0', 10);
+        const totalRuns = parseInt(localStorage.getItem(STORE_KEYS.TOTAL_RUNS) || '0', 10);
+        const km = (totalDist / 1000).toFixed(2);
+        const html = ACHIEVEMENTS.map(a => {
+            const ok = got.has(a.id);
+            return `<div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px solid #eee;opacity:${ok?1:.45}">
+                <div style="font-size:24px;width:32px;text-align:center;">${ok?a.ico:'🔒'}</div>
+                <div style="flex:1">
+                    <div style="font-size:13px;font-weight:600;color:#333">${a.title} ${ok?'<span style=\"color:#43A047;font-size:11px;margin-left:6px\">已解锁</span>':''}</div>
+                    <div style="font-size:11px;color:#777">${a.desc}</div>
+                </div>
+            </div>`;
+        }).join('');
+        const w = window.open('', '_blank', 'width=420,height=600');
+        if (w && w.document) {
+            w.document.title = '🏆 我的导航成就';
+            w.document.body.innerHTML = `
+                <div style="font-family:system-ui,sans-serif;padding:18px">
+                    <h2 style="margin:0 0 8px">🏆 我的导航成就</h2>
+                    <div style="font-size:12px;color:#666;margin-bottom:14px">
+                        累计完成 <b>${totalRuns}</b> 次 · 累计 <b>${km}</b> km · 解锁 <b>${got.size}/${ACHIEVEMENTS.length}</b>
+                    </div>
+                    ${html}
+                </div>`;
+            w.document.body.style.margin = '0';
+        } else {
+            // 兜底：alert
+            alert(`🏆 累计 ${totalRuns} 次 · ${km} km · 解锁 ${got.size}/${ACHIEVEMENTS.length}\n（请允许浏览器弹窗以查看详情）`);
+        }
+    }
+
+    // ============================================================
+    //   G5 随机冒险（在当前位置 5-15km 内随机一个目的地，并自动规划）
+    // ============================================================
+    async function randomAdventure() {
+        if (typeof routeOrigin === 'undefined' || !routeOrigin) {
+            alert('🎲 请先在路径规划面板设置一个起点（点击 📍 使用我的位置）');
+            return;
+        }
+        const km = 5 + Math.random() * 10;
+        const bearing = Math.random() * 360;
+        const R = 6371;
+        const lat1 = routeOrigin.lat * Math.PI / 180;
+        const lng1 = routeOrigin.lng * Math.PI / 180;
+        const dR = km / R;
+        const br = bearing * Math.PI / 180;
+        const lat2 = Math.asin(Math.sin(lat1) * Math.cos(dR) + Math.cos(lat1) * Math.sin(dR) * Math.cos(br));
+        const lng2 = lng1 + Math.atan2(
+            Math.sin(br) * Math.sin(dR) * Math.cos(lat1),
+            Math.cos(dR) - Math.sin(lat1) * Math.sin(lat2)
+        );
+        const destLat = lat2 * 180 / Math.PI;
+        const destLng = lng2 * 180 / Math.PI;
+        try {
+            if (typeof setRouteDestination === 'function') {
+                setRouteDestination(L.latLng(destLat, destLng), '🎲 随机目的地');
+            }
+            if (typeof planRoute === 'function') {
+                await planRoute();
+            }
+            showToast(`🎲 已随机生成 ${km.toFixed(1)} km 外的目的地，请开始模拟导航`, 'success');
+        } catch (e) {
+            alert('随机冒险失败：' + (e.message || e));
+        }
+    }
+
+    // ============================================================
+    //   R1 沿途 POI 提醒
+    // ============================================================
+    function showPoiToast(html) {
+        const el = $('nav-poi-toast');
+        if (!el) return;
+        el.innerHTML = html;
+        el.classList.remove('active');
+        void el.offsetWidth;
+        el.classList.add('active');
+        clearTimeout(showPoiToast._t);
+        showPoiToast._t = setTimeout(() => el.classList.remove('active'), 4000);
+    }
+    async function fetchAlongRoutePois(coords) {
+        // 在路径上稀疏采样 6 个点，分别围绕做 around 搜索（types=餐饮/购物/咖啡/便利店）
+        if (!coords || coords.length < 2) return [];
+        if (typeof AMAP_WEB_KEY === 'undefined' || !AMAP_WEB_KEY) return [];
+        const totalLen = (typeof navPolylineLength === 'function') ? navPolylineLength(coords) : 0;
+        if (!totalLen || totalLen < 500) return [];
+        const sampleN = Math.min(6, Math.max(3, Math.round(totalLen / 1500)));
+        const types = '050000|060000|070000|080000'; // 餐饮、购物、生活、体育休闲
+        const list = [];
+        const seen = new Set();
+        for (let i = 0; i < sampleN; i++) {
+            const d = totalLen * (i + 0.5) / sampleN;
+            const ll = sampleLatLngAt(coords, d);
+            if (!ll) continue;
+            try {
+                const url = `https://restapi.amap.com/v3/place/around?key=${AMAP_WEB_KEY}` +
+                    `&location=${ll[1].toFixed(6)},${ll[0].toFixed(6)}` +
+                    `&radius=300&types=${types}&offset=8&extensions=base&output=JSON`;
+                const r = await fetch(url);
+                const j = await r.json();
+                if (j && j.status === '1' && Array.isArray(j.pois)) {
+                    j.pois.forEach(p => {
+                        if (!p.location || seen.has(p.id)) return;
+                        seen.add(p.id);
+                        const [lng, lat] = p.location.split(',').map(parseFloat);
+                        if (!lat || !lng) return;
+                        // 投影回路径，记录沿路距离
+                        let proj = null;
+                        if (typeof navProjectOnPolyline === 'function') {
+                            proj = navProjectOnPolyline([lat, lng], coords);
+                        }
+                        if (!proj || proj.dist > 220) return;
+                        list.push({
+                            id: p.id, name: p.name, type: p.type || '',
+                            address: p.address || '',
+                            lat, lng, distFromRoute: proj.dist,
+                            traveled: proj.traveled
+                        });
+                    });
+                }
+            } catch (_) {}
+        }
+        // 按沿路距离排序、去重
+        list.sort((a, b) => a.traveled - b.traveled);
+        return list;
+    }
+    function poiTypeIcon(type) {
+        if (!type) return '📍';
+        if (type.includes('餐饮') || type.includes('咖啡')) return '☕';
+        if (type.includes('购物') || type.includes('超市') || type.includes('便利')) return '🛒';
+        if (type.includes('加油'))                             return '⛽';
+        if (type.includes('体育') || type.includes('休闲'))    return '🎮';
+        return '📍';
+    }
+    function checkPoiAlongRoute(traveled) {
+        if (!fx.poiCache.length) return;
+        fx.poiCache.forEach(p => {
+            if (fx.poiSeen.has(p.id)) return;
+            const ahead = p.traveled - traveled;
+            if (ahead > 0 && ahead < 200) {
+                fx.poiSeen.add(p.id);
+                const ico = poiTypeIcon(p.type);
+                showPoiToast(
+                    `<b>${ico} 前方 ${Math.round(ahead)} m</b> · ${p.name}` +
+                    (p.address ? `<div style="font-size:11px;color:#777;margin-top:3px">${p.address}</div>` : '')
+                );
+                try { (typeof navSpeak === 'function') && navSpeak(`前方${Math.round(ahead)}米，${p.name}`, { key: 'poi_' + p.id }); } catch(_) {}
+            }
+        });
+    }
+
+    // ============================================================
+    //   R3 实时天气（高德 weather/weatherInfo）
+    // ============================================================
+    async function refreshWeather(latlng) {
+        if (typeof AMAP_WEB_KEY === 'undefined' || !AMAP_WEB_KEY) return;
+        try {
+            // 先 regeo 拿 adcode
+            const u1 = `https://restapi.amap.com/v3/geocode/regeo?key=${AMAP_WEB_KEY}` +
+                `&location=${latlng[1].toFixed(6)},${latlng[0].toFixed(6)}&extensions=base&output=JSON`;
+            const r1 = await fetch(u1).then(r => r.json());
+            const adcode = r1 && r1.regeocode && r1.regeocode.addressComponent && r1.regeocode.addressComponent.adcode;
+            if (!adcode) return;
+            const u2 = `https://restapi.amap.com/v3/weather/weatherInfo?key=${AMAP_WEB_KEY}&city=${adcode}&extensions=base&output=JSON`;
+            const r2 = await fetch(u2).then(r => r.json());
+            if (r2 && r2.status === '1' && r2.lives && r2.lives[0]) {
+                const w = r2.lives[0];
+                const ico = weatherEmoji(w.weather);
+                fx.weatherChip = `${ico} ${w.weather} ${w.temperature}°`;
+                const chip = $('nav-hud-weather');
+                if (chip) chip.textContent = fx.weatherChip;
+                // 自动切天气特效（仅在 clear 时根据天气自动切，已手动选则尊重）
+                if (fx.weatherMode === 'clear') {
+                    if (/雨/.test(w.weather)) setWeatherMode('rain');
+                    else if (/雪/.test(w.weather)) setWeatherMode('snow');
+                    else if (/雾|霾/.test(w.weather)) setWeatherMode('fog');
+                }
+            }
+        } catch (_) {}
+    }
+    function weatherEmoji(text) {
+        if (!text) return '🌤';
+        if (/晴/.test(text))   return '☀️';
+        if (/雷/.test(text))   return '⛈';
+        if (/雨/.test(text))   return '🌧';
+        if (/雪/.test(text))   return '❄️';
+        if (/雾|霾/.test(text)) return '🌫';
+        if (/云|阴/.test(text)) return '☁️';
+        return '🌤';
+    }
+
+    // ============================================================
+    //   D1 速度曲线（采样）+ 完成时画 SVG
+    // ============================================================
+    function sampleSpeed(traveled, speed) {
+        const now = Date.now();
+        if (now - fx.lastSampleAt < 1000) return;     // 1s 一采样
+        fx.lastSampleAt = now;
+        fx.speedSamples.push({ d: traveled, v: speed || 0 });
+        // 控制点数上限
+        if (fx.speedSamples.length > 800) fx.speedSamples.splice(0, 200);
+    }
+    function buildSpeedChartSVG() {
+        const arr = fx.speedSamples;
+        if (!arr || arr.length < 3) return '<div style="font-size:12px;color:#888;text-align:center;padding:8px">📈 速度曲线数据不足</div>';
+        const W = 320, H = 80, PAD = 8;
+        const maxD = arr[arr.length - 1].d || 1;
+        let maxV = 0; arr.forEach(p => { if (p.v > maxV) maxV = p.v; });
+        if (maxV < 1) maxV = 1;
+        const pts = arr.map(p => {
+            const x = PAD + (p.d / maxD) * (W - PAD * 2);
+            const y = PAD + (1 - p.v / maxV) * (H - PAD * 2);
+            return [x, y];
+        });
+        const pathD = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
+        const areaD = pathD + ` L${pts[pts.length-1][0].toFixed(1)},${(H-PAD).toFixed(1)} L${pts[0][0].toFixed(1)},${(H-PAD).toFixed(1)} Z`;
+        const km = (maxD / 1000).toFixed(2);
+        const kmh = (maxV * 3.6).toFixed(1);
+        return `
+<div style="font-size:11px;color:#666;text-align:left;margin:0 0 4px 4px">📈 速度曲线 · 全程 ${km} km · 峰值 ${kmh} km/h</div>
+<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="spdGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1E88E5" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#1E88E5" stop-opacity="0.05"/>
+    </linearGradient>
+  </defs>
+  <path d="${areaD}" fill="url(#spdGrad)"/>
+  <path d="${pathD}" fill="none" stroke="#1E88E5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+    }
+
+    // ============================================================
+    //   D3 历史轨迹热力图
+    // ============================================================
+    function toggleHistoryHeatmap() {
+        if (fx.heatOn) {
+            if (fx.heatLayer) { try { map.removeLayer(fx.heatLayer); } catch (_) {} fx.heatLayer = null; }
+            fx.heatOn = false;
+            const btn = $('nav-fx-heatmap');
+            if (btn) btn.textContent = '🔥 热力 OFF';
+            return;
+        }
+        const list = (typeof loadNavHistory === 'function') ? loadNavHistory() : [];
+        if (!list.length) {
+            alert('🔥 暂无历史导航记录\n完成几次导航后再来看吧');
+            return;
+        }
+        // 由于历史记录里没存完整路径（节省空间），只能用起终点连线作为热力源
+        const pts = [];
+        list.forEach(it => {
+            if (it.origin)        pts.push([it.origin.lat, it.origin.lng, 0.9]);
+            if (it.dest)          pts.push([it.dest.lat,   it.dest.lng,   0.9]);
+            // 在起终点直线上插值若干点（粗略代表路径）
+            if (it.origin && it.dest) {
+                const N = 8;
+                for (let i = 1; i < N; i++) {
+                    const t = i / N;
+                    pts.push([
+                        it.origin.lat + (it.dest.lat - it.origin.lat) * t,
+                        it.origin.lng + (it.dest.lng - it.origin.lng) * t,
+                        0.5
+                    ]);
+                }
+            }
+        });
+        if (!pts.length) { alert('🔥 历史记录里没有有效坐标'); return; }
+        if (typeof L.heatLayer !== 'function') { alert('🔥 缺少 leaflet.heat 插件'); return; }
+        fx.heatLayer = L.heatLayer(pts, { radius: 25, blur: 20, maxZoom: 17 }).addTo(map);
+        fx.heatOn = true;
+        const btn = $('nav-fx-heatmap');
+        if (btn) btn.textContent = '🔥 热力 ON';
+        // 自适应视野
+        try {
+            const b = L.latLngBounds(pts.map(p => [p[0], p[1]]));
+            map.fitBounds(b, { padding: [40, 40] });
+        } catch (_) {}
+        showToast('🔥 已叠加历史轨迹热力图', 'success');
+    }
+
+    // ============================================================
+    //   D4 GPX 导出
+    // ============================================================
+    function exportLastGpx() {
+        // 优先导出当前正在 / 刚完成的导航坐标
+        let coords = (typeof navCoords !== 'undefined') ? navCoords : null;
+        let title = '本次导航';
+        if (!coords || coords.length < 2) {
+            // 兜底：找当前已规划路线
+            if (typeof alternativeData !== 'undefined' && alternativeData && alternativeData.length) {
+                const main = alternativeData[selectedAlternativeIdx] || alternativeData[0];
+                coords = main.coords;
+                title = '当前规划路线';
+            }
+        }
+        if (!coords || coords.length < 2) {
+            alert('💾 没有可导出的轨迹\n请先规划/完成一次导航');
+            return;
+        }
+        const date = new Date().toISOString();
+        const trkpts = coords.map(([lat, lng]) =>
+            `      <trkpt lat="${lat.toFixed(6)}" lon="${lng.toFixed(6)}"><time>${date}</time></trkpt>`).join('\n');
+        const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="leafletdemo01"
+     xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata><name>${title}</name><time>${date}</time></metadata>
+  <trk><name>${title}</name><trkseg>
+${trkpts}
+  </trkseg></trk>
+</gpx>`;
+        const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `nav_${Date.now()}.gpx`;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { try { a.remove(); URL.revokeObjectURL(url); } catch (_) {} }, 200);
+        showToast('💾 已导出 GPX', 'success');
+    }
+
+    // ============================================================
+    //   时段自动判定（按系统当前小时数）
+    // ============================================================
+    function autoTimeMode() {
+        const h = new Date().getHours();
+        if (h >= 6 && h < 17)       setTimeMode('day');
+        else if (h >= 17 && h < 19) setTimeMode('dusk');
+        else                        setTimeMode('night');
+    }
+
+    // ============================================================
+    //   生命周期 hook：暴露给主流程
+    // ============================================================
+    window.navFxOnStart = function (info) {
+        fx.poiSeen.clear();
+        fx.poiCache = [];
+        fx.speedSamples = [];
+        fx.lastSampleAt = 0;
+        fx.score = 0;
+        const chip = $('nav-hud-score');
+        if (chip) chip.textContent = '🪙 0';
+
+        // 自动时段
+        autoTimeMode();
+        // 流光
+        applyGlowToAhead();
+        // 粒子尾迹
+        startParticleTrail();
+        // 金币撒落
+        if (fx.coinModeOn) spawnCoins(info.coords, info.totalDist);
+        // 异步拉取沿路 POI（最多 6 个采样点）
+        fetchAlongRoutePois(info.coords).then(list => {
+            fx.poiCache = list;
+            if (list.length) showToast(`🍱 沿途发现 ${list.length} 个 POI，将依次提醒`, 'info');
+        }).catch(() => {});
+        // 异步拉取实时天气（终点）
+        if (info.dest) refreshWeather([info.dest.lat, info.dest.lng]);
+        else if (info.coords && info.coords[0]) refreshWeather(info.coords[0]);
+        // 挑战 chip 复位
+        if (fx.challengeOn) {
+            const cChip = $('nav-hud-challenge');
+            if (cChip) cChip.style.display = '';
+        }
+    };
+
+    window.navFxOnAdvance = function (info) {
+        const t = info.traveled;
+        // 速度采样
+        sampleSpeed(t, info.speed);
+        // 金币
+        checkCoinPick(t);
+        // POI
+        checkPoiAlongRoute(t);
+    };
+
+    window.navFxOnFinish = function (info) {
+        // 累计统计
+        const cum = addCumStats(info.distance);
+
+        // 完成弹窗速度曲线
+        const chartEl = $('nav-finish-chart');
+        if (chartEl) chartEl.innerHTML = buildSpeedChartSVG();
+
+        // 是否赢得挑战
+        const challengeWon = fx.challengeOn && Date.now() <= fx.challengeDeadline;
+
+        // 触发成就
+        const last = {
+            distance: info.distance,
+            duration: info.duration,
+            avgSpeed: info.avgSpeed,
+            maxSpeed: info.maxSpeed,
+            score: fx.score,
+            challengeWon
+        };
+        const newly = checkAchievements(last);
+        // 挑战结果弹一下
+        if (fx.challengeOn) {
+            setTimeout(() => {
+                if (challengeWon) showAchievement('🎯', '挑战成功！', '在限时内完成了导航');
+                else              showAchievement('⏰', '挑战未完成', '下次再战，差一点点就赢了');
+                stopChallenge();
+            }, 600);
+        }
+        // 金币结算
+        if (fx.coinModeOn && fx.score > 0) {
+            setTimeout(() => showAchievement('🪙', '本次金币 +' + fx.score, '已自动累计到成就系统'), 1200);
+        }
+    };
+
+    window.navFxOnStop = function () {
+        stopParticleTrail();
+        clearCoins();
+        // 重置流光样式
+        try {
+            if (typeof navAheadLine !== 'undefined' && navAheadLine) {
+                const el = navAheadLine.getElement && navAheadLine.getElement();
+                if (el) el.classList.remove('nav-glow-walked');
+            }
+        } catch (_) {}
+        // POI 提示气泡关闭
+        const pt = $('nav-poi-toast');
+        if (pt) pt.classList.remove('active');
+    };
+
+    // ============================================================
+    //   绑定浮动菜单按钮
+    // ============================================================
+    function bindFxMenu() {
+        const btnTime = $('nav-fx-time');
+        if (btnTime) btnTime.addEventListener('click', () => {
+            const next = ({ day: 'dusk', dusk: 'night', night: 'day' })[fx.timeMode] || 'day';
+            setTimeMode(next);
+        });
+        const btnW = $('nav-fx-weather');
+        if (btnW) btnW.addEventListener('click', () => {
+            const next = ({ clear: 'rain', rain: 'snow', snow: 'fog', fog: 'clear' })[fx.weatherMode] || 'clear';
+            setWeatherMode(next);
+        });
+        const btnG = $('nav-fx-glow');
+        if (btnG) btnG.addEventListener('click', toggleGlow);
+
+        const btnC = $('nav-fx-coin');
+        if (btnC) btnC.addEventListener('click', toggleCoinMode);
+        const btnCh = $('nav-fx-challenge');
+        if (btnCh) btnCh.addEventListener('click', toggleChallenge);
+        const btnR = $('nav-fx-random');
+        if (btnR) btnR.addEventListener('click', randomAdventure);
+
+        const btnH = $('nav-fx-heatmap');
+        if (btnH) btnH.addEventListener('click', toggleHistoryHeatmap);
+        const btnE = $('nav-fx-export');
+        if (btnE) btnE.addEventListener('click', exportLastGpx);
+        const btnA = $('nav-fx-achv');
+        if (btnA) btnA.addEventListener('click', openAchievementsModal);
+
+        // 初始按系统时间设置
+        autoTimeMode();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', bindFxMenu);
+    } else {
+        bindFxMenu();
+    }
+
+    // 暴露调试入口（可在控制台调用）
+    window.__navFx = {
+        setTimeMode, setWeatherMode, toggleGlow,
+        toggleCoinMode, toggleChallenge, openAchievementsModal,
+        toggleHistoryHeatmap, exportLastGpx, randomAdventure,
+        state: fx
+    };
+
+    console.log('%c[NavFx] 超级导航增强已加载 ✨',
+        'color:#ad1457;font-weight:bold;background:#fce4ec;padding:2px 6px;border-radius:3px');
+})();
