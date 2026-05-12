@@ -1320,6 +1320,12 @@ const routeCitiesEl = document.getElementById('route-cities');
 const routeCityInput = document.getElementById('route-city');
 const routeCitydInput = document.getElementById('route-cityd');
 const routeTransitsEl = document.getElementById('route-transits');
+// 高级特性 DOM
+const routeStrategyWrapEl = document.getElementById('route-strategy');
+const routeStrategySelect = document.getElementById('route-strategy-select');
+const routeWaypointsEl = document.getElementById('route-waypoints');
+const addWaypointBtn = document.getElementById('add-waypoint-btn');
+const routeAlternativesEl = document.getElementById('route-alternatives');
 
 // 起/终点输入联想相关 DOM
 const routeOriginInputWrap = document.getElementById('route-origin-input-wrap');
@@ -1329,16 +1335,35 @@ const routeDestInputWrap = document.getElementById('route-destination-input-wrap
 const routeDestInput = document.getElementById('route-destination-input');
 const routeDestTipsEl = document.getElementById('route-destination-tips');
 
+// 途经点搜索（A 方案）DOM
+const waypointSearchWrap = document.getElementById('waypoint-search-wrap');
+const waypointSearchInput = document.getElementById('waypoint-search-input');
+const waypointSearchClear = document.getElementById('waypoint-search-clear');
+const waypointSearchTipsEl = document.getElementById('waypoint-search-tips');
+
+// 📍 "我的位置" 按钮 DOM
+const routeOriginLocateBtn = document.getElementById('route-origin-locate');
+const routeDestLocateBtn = document.getElementById('route-destination-locate');
+
 // 当前状态
 let routeMode = 'driving';              // driving | walking | bicycling | transit
 let routeOrigin = null;                  // { lat, lng, name }
 let routeDestination = null;             // { lat, lng, name }
 let routeOriginMarker = null;
 let routeDestMarker = null;
-let routePolyline = null;                // 驾/走/骑 模式的单条线
+let routePolyline = null;                // 驾/走/骑 模式的当前主路线
 let transitPolylines = [];               // 公交模式的多段线
 let currentTransits = [];                // 最近一次接口返回的方案列表
 let selectedTransitIndex = -1;
+// --- 路径规划高级特性状态 ---
+let routeWaypoints = [];                 // [{ lat, lng, name }]，最多 16 个，仅 driving 生效
+let waypointMarkers = [];                // 与 routeWaypoints 一一对应的 L.Marker
+let routeStrategy = '0';                 // 高德 driving strategy（字符串，便于直接拼 url）
+const ROUTE_WAYPOINT_LIMIT = 16;         // 高德 driving waypoints 上限
+let alternativePolylines = [];           // 多策略对比时所有候选路线（不含主路线）的弱化绘制
+let alternativeData = [];                // [{ name, distance, duration, coords, color, strategyText }]
+let selectedAlternativeIdx = 0;          // 当前选中的方案索引（主路线）
+const ALT_COLORS = ['#1E88E5', '#FB8C00', '#43A047']; // 主线、备选 1、备选 2 的色板
 
 // --- 轨迹动画回放（蚂蚁线 + 移动 Marker）相关状态 ---
 let trackAnimCoords = [];                // 当前可回放的坐标序列 [[lat, lng], ...]
@@ -1655,6 +1680,151 @@ function setRouteDestination(latlng, name) {
     if (routeOrigin) planRoute();
 }
 
+// ============================================================
+// 📍 「我的当前位置」工具 —— 起/终点自动填入支持
+// 设计：
+//   - 优先 navigator.geolocation（精度高，需用户授权）
+//   - 失败/拒绝 -> 降级 高德 /v3/ip 定位（精度只到城市，但不需授权）
+//   - 拿到坐标后通过 reverseGeocode 反查地址作为显示名
+//   - 用 myLocationCache 缓存，避免反复请求
+//   - 首次 fresh=true 强制刷新；其它默认走缓存（5 分钟内）
+// ============================================================
+let myLocationCache = null;        // { latlng, name, source: 'gps'|'ip', ts }
+let myLocationPending = null;      // Promise，并发请求只发一次
+const MY_LOCATION_TTL = 5 * 60 * 1000; // 5 分钟
+
+function getMyLocation({ fresh = false, allowIpFallback = true, silent = false } = {}) {
+    // 命中缓存
+    if (!fresh && myLocationCache && (Date.now() - myLocationCache.ts < MY_LOCATION_TTL)) {
+        return Promise.resolve(myLocationCache);
+    }
+    if (myLocationPending) return myLocationPending;
+
+    myLocationPending = new Promise((resolve) => {
+        const tryIp = async () => {
+            if (!allowIpFallback || !AMAP_WEB_KEY || AMAP_WEB_KEY === 'YOUR_AMAP_WEB_KEY_HERE') {
+                resolve(null); return;
+            }
+            try {
+                const url = `https://restapi.amap.com/v3/ip?key=${AMAP_WEB_KEY}`;
+                const resp = await fetch(url);
+                const data = await resp.json();
+                // 高德 IP 定位返回 rectangle="lng1,lat1;lng2,lat2"，取中点
+                if (data.status === '1' && data.rectangle) {
+                    const parts = data.rectangle.split(';');
+                    if (parts.length === 2) {
+                        const [lng1, lat1] = parts[0].split(',').map(Number);
+                        const [lng2, lat2] = parts[1].split(',').map(Number);
+                        if (!isNaN(lng1) && !isNaN(lat1) && !isNaN(lng2) && !isNaN(lat2)) {
+                            const lng = (lng1 + lng2) / 2;
+                            const lat = (lat1 + lat2) / 2;
+                            const latlng = L.latLng(lat, lng);
+                            const name = (data.province || '') + (data.city || '') + '（IP 定位）';
+                            myLocationCache = { latlng, name: name || '我的位置', source: 'ip', ts: Date.now() };
+                            resolve(myLocationCache);
+                            return;
+                        }
+                    }
+                }
+                resolve(null);
+            } catch (err) {
+                console.warn('IP 定位失败:', err);
+                resolve(null);
+            }
+        };
+
+        if (!navigator.geolocation) {
+            tryIp();
+            return;
+        }
+        navigator.geolocation.getCurrentPosition(
+            async (position) => {
+                const { latitude, longitude, accuracy } = position.coords;
+                // WGS-84 -> GCJ-02
+                const [gcjLng, gcjLat] = CoordTransform.wgs84ToGcj02(longitude, latitude);
+                const latlng = L.latLng(gcjLat, gcjLng);
+                let addr = '';
+                try { addr = await reverseGeocode(latlng); } catch (e) {}
+                myLocationCache = {
+                    latlng,
+                    name: addr || '我的当前位置',
+                    source: 'gps',
+                    accuracy,
+                    ts: Date.now()
+                };
+                resolve(myLocationCache);
+            },
+            (error) => {
+                if (!silent) {
+                    console.warn('浏览器定位失败，将尝试 IP 定位兜底:', error && error.message);
+                }
+                tryIp();
+            },
+            { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
+        );
+    }).finally(() => { myLocationPending = null; });
+
+    return myLocationPending;
+}
+
+// 把"我的位置"应用到指定端点（origin / destination / waypoint-add）
+async function useMyLocationFor(kind, opts = {}) {
+    if (typeof checkKey === 'function' && !checkKey()) return null;
+    const btn = kind === 'origin' ? routeOriginLocateBtn
+              : kind === 'destination' ? routeDestLocateBtn
+              : null;
+    if (btn) btn.classList.add('loading');
+    try {
+        const loc = await getMyLocation({ fresh: !!opts.fresh });
+        if (!loc) {
+            alert('无法获取当前位置：浏览器定位被拒绝且 IP 定位失败');
+            return null;
+        }
+        if (kind === 'origin') {
+            setRouteOrigin(loc.latlng, loc.name);
+        } else if (kind === 'destination') {
+            setRouteDestination(loc.latlng, loc.name);
+        } else if (kind === 'waypoint-add') {
+            if (typeof addRouteWaypoint === 'function') {
+                addRouteWaypoint(loc.latlng, loc.name);
+            }
+        }
+        return loc;
+    } finally {
+        if (btn) btn.classList.remove('loading');
+    }
+}
+
+// 📍 按钮点击事件绑定
+if (routeOriginLocateBtn) {
+    routeOriginLocateBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        useMyLocationFor('origin', { fresh: true });
+    });
+}
+if (routeDestLocateBtn) {
+    routeDestLocateBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        useMyLocationFor('destination', { fresh: true });
+    });
+}
+
+// 🚀 页面加载后：静默尝试一次定位 + 自动填入起点（若用户尚未设过起点）
+// 关键：只在用户尚未设置起点时才填，避免覆盖用户自己的选择
+function tryAutoFillOriginByMyLocation() {
+    if (routeOrigin) return; // 用户已设
+    // 静默调用：失败也不打扰用户，仅记录到缓存
+    getMyLocation({ silent: true }).then(loc => {
+        if (!loc) return;
+        // 二次确认（异步等待期间用户可能已手动选了起点）
+        if (routeOrigin) return;
+        setRouteOrigin(loc.latlng, loc.name);
+    });
+}
+// 延迟 800ms 执行，让其它初始化先完成
+setTimeout(tryAutoFillOriginByMyLocation, 800);
+
+
 function clearRouteOrigin() {
     routeOrigin = null;
     if (routeOriginMarker) { map.removeLayer(routeOriginMarker); routeOriginMarker = null; }
@@ -1669,14 +1839,481 @@ function clearRouteDestination() {
     updateRoutePointsUI();
 }
 
+// ============== 途经点（waypoints） ==============
+// 紫色编号 marker，标识第几个途经点
+function createWaypointIcon(idx) {
+    return L.divIcon({
+        className: 'route-waypoint-marker',
+        html: `<div style="
+            width: 26px; height: 26px; line-height: 26px;
+            background: #8E24AA; color: #fff;
+            border: 2px solid #fff; border-radius: 50%;
+            text-align: center; font-size: 12px; font-weight: bold;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+        ">${idx + 1}</div>`,
+        iconSize: [26, 26],
+        iconAnchor: [13, 13]
+    });
+}
+
+// 重绘所有途经点 marker（编号会随顺序变化，故每次整体重建）
+function rebuildWaypointMarkers() {
+    waypointMarkers.forEach(m => { try { map.removeLayer(m); } catch (e) {} });
+    waypointMarkers = routeWaypoints.map((wp, i) => {
+        const marker = L.marker([wp.lat, wp.lng], {
+            icon: createWaypointIcon(i),
+            draggable: false,
+            zIndexOffset: 500
+        }).addTo(map).bindPopup(
+            `<b>途经点 ${i + 1}</b><br/>${escapeHtml(wp.name || '')}<br/>${wp.lng.toFixed(6)}, ${wp.lat.toFixed(6)}`
+        );
+        return marker;
+    });
+}
+
+// 渲染面板里的途经点列表
+function renderWaypointsUI() {
+    if (!routeWaypointsEl) return;
+    // 公交模式不支持途径点（高德接口限制 + 拼接体验差），其它模式都支持
+    const supportWaypoint = routeMode !== 'transit';
+    if (!supportWaypoint || routeWaypoints.length === 0) {
+        routeWaypointsEl.classList.remove('active');
+        routeWaypointsEl.innerHTML = '';
+    } else {
+        routeWaypointsEl.classList.add('active');
+        routeWaypointsEl.innerHTML = routeWaypoints.map((wp, i) => {
+            const text = escapeHtml(wp.name || `${wp.lng.toFixed(5)}, ${wp.lat.toFixed(5)}`);
+            return `
+                <div class="waypoint-item" data-idx="${i}">
+                    <span class="dot">${i + 1}</span>
+                    <span class="text editable" data-act="edit" title="点击编辑此途经点：${text}">${text}</span>
+                    <span class="move-btn" data-act="up" title="上移">▲</span>
+                    <span class="move-btn" data-act="down" title="下移">▼</span>
+                    <span class="clear-btn" data-act="del" title="删除">✕</span>
+                </div>`;
+        }).join('');
+    }
+    // 加号按钮可用性：非公交模式 + 未达上限
+    if (addWaypointBtn) {
+        const canAdd = supportWaypoint && routeWaypoints.length < ROUTE_WAYPOINT_LIMIT;
+        addWaypointBtn.disabled = !canAdd;
+        addWaypointBtn.style.display = supportWaypoint ? 'block' : 'none';
+        addWaypointBtn.textContent = supportWaypoint
+            ? `➕ 添加途经点（${routeWaypoints.length}/${ROUTE_WAYPOINT_LIMIT}）`
+            : '➕ 添加途经点（公交不支持）';
+    }
+}
+
+// 是否当前路径模式支持途径点（公交不支持；驾车支持原生 waypoints；骑行/步行用前端分段拼接）
+function isWaypointSupportedMode() {
+    return routeMode === 'driving' || routeMode === 'walking' || routeMode === 'bicycling';
+}
+
+// 添加一个途经点
+async function addRouteWaypoint(latlng, name) {
+    if (routeWaypoints.length >= ROUTE_WAYPOINT_LIMIT) {
+        alert(`途经点最多 ${ROUTE_WAYPOINT_LIMIT} 个`);
+        return;
+    }
+    if (!isWaypointSupportedMode()) {
+        // 公交：保留数据但提示用户不会被使用
+        alert('途经点在公交模式下不生效（高德公交接口不支持），已为你保留，切到驾车/步行/骑行后会自动启用。');
+    }
+    routeWaypoints.push({ lat: latlng.lat, lng: latlng.lng, name: name || '' });
+    rebuildWaypointMarkers();
+    renderWaypointsUI();
+    // 异步补地址
+    if (!name) {
+        const addr = await reverseGeocodeIfPossible(latlng);
+        const idx = routeWaypoints.findIndex(
+            wp => wp.lat === latlng.lat && wp.lng === latlng.lng
+        );
+        if (addr && idx >= 0) {
+            routeWaypoints[idx].name = addr;
+            rebuildWaypointMarkers();
+            renderWaypointsUI();
+        }
+    }
+    // 起终点都齐 -> 自动重规划（驾车/步行/骑行）
+    if (isWaypointSupportedMode() && routeOrigin && routeDestination) planRoute();
+}
+
+// 删除某个途经点
+function removeWaypoint(idx) {
+    if (idx < 0 || idx >= routeWaypoints.length) return;
+    routeWaypoints.splice(idx, 1);
+    rebuildWaypointMarkers();
+    renderWaypointsUI();
+    if (isWaypointSupportedMode() && routeOrigin && routeDestination) planRoute();
+}
+
+// 上下移动
+function moveWaypoint(idx, dir) {
+    const ni = idx + dir;
+    if (ni < 0 || ni >= routeWaypoints.length) return;
+    const tmp = routeWaypoints[idx];
+    routeWaypoints[idx] = routeWaypoints[ni];
+    routeWaypoints[ni] = tmp;
+    rebuildWaypointMarkers();
+    renderWaypointsUI();
+    if (isWaypointSupportedMode() && routeOrigin && routeDestination) planRoute();
+}
+
+// 清空途经点
+function clearAllWaypoints() {
+    waypointMarkers.forEach(m => { try { map.removeLayer(m); } catch (e) {} });
+    waypointMarkers = [];
+    routeWaypoints = [];
+    renderWaypointsUI();
+}
+
+// ============== B 方案：编辑指定途经点 ==============
+// 用新坐标 + 名称替换 idx 位置的途经点；触发自动重规划
+async function replaceWaypoint(idx, latlng, name) {
+    if (idx < 0 || idx >= routeWaypoints.length) return;
+    routeWaypoints[idx] = { lat: latlng.lat, lng: latlng.lng, name: name || '' };
+    rebuildWaypointMarkers();
+    renderWaypointsUI();
+    // 没传 name 时异步反查地址
+    if (!name) {
+        const addr = await reverseGeocodeIfPossible(latlng);
+        if (addr && routeWaypoints[idx]
+            && routeWaypoints[idx].lat === latlng.lat
+            && routeWaypoints[idx].lng === latlng.lng) {
+            routeWaypoints[idx].name = addr;
+            rebuildWaypointMarkers();
+            renderWaypointsUI();
+        }
+    }
+    if (isWaypointSupportedMode() && routeOrigin && routeDestination) planRoute();
+}
+
+// 当前编辑的途经点 idx（-1 表示不在编辑态）
+let editingWaypointIdx = -1;
+let editingWaypointCleanup = null;
+
+// 进入"编辑某个途经点"状态：把对应 .waypoint-item 替换为 input + tips
+function enterWaypointEdit(idx) {
+    if (idx < 0 || idx >= routeWaypoints.length) return;
+    // 已经在编辑同一条 -> 忽略；编辑另一条 -> 先收起前一个
+    if (editingWaypointIdx === idx) return;
+    if (editingWaypointCleanup) {
+        try { editingWaypointCleanup(); } catch (e) {}
+    }
+    editingWaypointIdx = idx;
+
+    const itemEl = routeWaypointsEl.querySelector(`.waypoint-item[data-idx="${idx}"]`);
+    if (!itemEl) { editingWaypointIdx = -1; return; }
+    itemEl.classList.add('editing');
+
+    // 隐藏文字 -> 注入 input 和 tips 容器（注意 tips 复用 .route-tips 样式）
+    const textSpan = itemEl.querySelector('.text');
+    const moveBtns = itemEl.querySelectorAll('.move-btn');
+    moveBtns.forEach(b => b.style.display = 'none');
+    if (textSpan) textSpan.style.display = 'none';
+
+    const wp = routeWaypoints[idx];
+    const inputEl = document.createElement('input');
+    inputEl.type = 'text';
+    inputEl.className = 'waypoint-edit-input';
+    inputEl.placeholder = '搜索新地点替换 / Enter 确认 / Esc 取消';
+    inputEl.value = wp.name || '';
+    // 将 input 和 tips 插到 dot 之后
+    const dotEl = itemEl.querySelector('.dot');
+    const tipsEl = document.createElement('div');
+    tipsEl.className = 'route-tips';
+    if (dotEl && dotEl.nextSibling) {
+        itemEl.insertBefore(inputEl, dotEl.nextSibling);
+        itemEl.insertBefore(tipsEl, dotEl.nextSibling.nextSibling);
+    } else {
+        itemEl.appendChild(inputEl);
+        itemEl.appendChild(tipsEl);
+    }
+
+    // 用复用的工厂创建一个绑定到该 input/tips 的小控制器
+    const ctl = createTipsController({
+        inputEl,
+        tipsEl,
+        onPick: (latlng, name) => { exit(); replaceWaypoint(idx, latlng, name); }
+    });
+
+    function exit() {
+        // 清理 DOM
+        try { inputEl.remove(); } catch (e) {}
+        try { tipsEl.remove(); } catch (e) {}
+        if (textSpan) textSpan.style.display = '';
+        moveBtns.forEach(b => b.style.display = '');
+        itemEl.classList.remove('editing');
+        editingWaypointIdx = -1;
+        editingWaypointCleanup = null;
+        document.removeEventListener('click', onDocClick, true);
+    }
+    function onDocClick(e) {
+        if (!itemEl.contains(e.target)) exit();
+    }
+    // 点击外部退出
+    setTimeout(() => document.addEventListener('click', onDocClick, true), 0);
+
+    inputEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); exit(); }
+    });
+
+    editingWaypointCleanup = exit;
+
+    // 自动 focus 并触发首次联想
+    setTimeout(() => {
+        inputEl.focus();
+        inputEl.select();
+        if (inputEl.value.trim()) ctl.fetchTips(inputEl.value.trim());
+    }, 0);
+}
+
+// ============== A 方案：底部"搜索 POI 添加为途经点"输入框 ==============
+let waypointSearchCtl = null;
+function setupWaypointSearchPanel() {
+    if (!waypointSearchInput || !waypointSearchTipsEl) return;
+    const rowEl = waypointSearchInput.closest('.waypoint-search-row');
+
+    const ctl = createTipsController({
+        inputEl: waypointSearchInput,
+        tipsEl: waypointSearchTipsEl,
+        onPick: (latlng, name) => {
+            // 添加为新的途经点（注意：到达上限会被 addRouteWaypoint 内部 alert）
+            addRouteWaypoint(latlng, name);
+            // 清空输入便于继续搜索；保留 focus
+            waypointSearchInput.value = '';
+            if (rowEl) rowEl.classList.remove('has-value');
+            ctl.hideTips();
+        }
+    });
+
+    waypointSearchInput.addEventListener('input', () => {
+        if (rowEl) {
+            rowEl.classList.toggle('has-value', !!waypointSearchInput.value);
+        }
+    });
+
+    if (waypointSearchClear) {
+        waypointSearchClear.addEventListener('click', () => {
+            waypointSearchInput.value = '';
+            if (rowEl) rowEl.classList.remove('has-value');
+            ctl.hideTips();
+            waypointSearchInput.focus();
+        });
+    }
+
+    // 点外部收起联想
+    document.addEventListener('click', (e) => {
+        if (!waypointSearchWrap.contains(e.target)) ctl.hideTips();
+    });
+
+    waypointSearchCtl = ctl;
+    refreshWaypointSearchVisibility();
+}
+
+// 控制搜索框可见性：公交模式隐藏；其它显示
+function refreshWaypointSearchVisibility() {
+    if (!waypointSearchWrap) return;
+    if (routeMode === 'transit') {
+        waypointSearchWrap.classList.add('hidden');
+        if (waypointSearchCtl) waypointSearchCtl.hideTips();
+    } else {
+        waypointSearchWrap.classList.remove('hidden');
+    }
+}
+
+// ============== 通用：tips 控制器工厂（供"编辑某个途经点"和"添加搜索"复用）==============
+// 参数：
+//   inputEl   <input>       绑定输入框
+//   tipsEl    <div>         联想下拉容器（需提前应用 .route-tips 类）
+//   onPick    (latlng, name) => void   选中某条联想结果时回调
+// 返回：{ fetchTips, hideTips }
+function createTipsController({ inputEl, tipsEl, onPick }) {
+    let debounceTimer = null;
+    let abortCtl = null;
+    let tips = [];
+    let highlight = -1;
+
+    function hideTips() {
+        tipsEl.classList.remove('active');
+        tipsEl.innerHTML = '';
+        tips = [];
+        highlight = -1;
+    }
+
+    function getPreferredCity() {
+        const fromRoute = (routeCityInput && routeCityInput.value || '').trim();
+        if (fromRoute) return fromRoute;
+        if (typeof poiCityEl !== 'undefined' && poiCityEl && poiCityEl.value) {
+            return poiCityEl.value.trim();
+        }
+        return '';
+    }
+
+    function renderTips(list) {
+        tips = list;
+        highlight = -1;
+        if (!list || !list.length) {
+            tipsEl.innerHTML = '<div class="route-tip-empty">无匹配结果</div>';
+            tipsEl.classList.add('active');
+            return;
+        }
+        tipsEl.innerHTML = list.map((t, i) => {
+            const district = [t.district, t.address].filter(Boolean).join(' · ');
+            const info = (typeof classifyTip === 'function') ? classifyTip(t) : { emoji: '📍', label: '' };
+            return `<div class="route-tip-item" data-index="${i}" title="${escapeHtml(info.label || '')}">
+                <span class="tip-icon">${info.emoji}</span>
+                <span class="tip-body">
+                    <span class="tip-name">${escapeHtml(t.name || '')}</span>
+                    ${district ? `<span class="tip-district">${escapeHtml(district)}</span>` : ''}
+                </span>
+            </div>`;
+        }).join('');
+        tipsEl.classList.add('active');
+        tipsEl.querySelectorAll('.route-tip-item').forEach(el => {
+            el.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                const idx = parseInt(el.getAttribute('data-index'), 10);
+                pickTip(idx);
+            });
+        });
+    }
+
+    function updateHighlight() {
+        const items = tipsEl.querySelectorAll('.route-tip-item');
+        items.forEach((el, i) => el.classList.toggle('highlight', i === highlight));
+        if (highlight >= 0 && items[highlight]) {
+            items[highlight].scrollIntoView({ block: 'nearest' });
+        }
+    }
+
+    function pickTip(idx) {
+        const tip = tips[idx];
+        if (!tip) return;
+        const name = tip.name || '';
+        if (tip.location && typeof tip.location === 'string' && tip.location.includes(',')) {
+            const [lngStr, latStr] = tip.location.split(',');
+            const lng = parseFloat(lngStr);
+            const lat = parseFloat(latStr);
+            if (!isNaN(lng) && !isNaN(lat)) {
+                onPick(L.latLng(lat, lng), name);
+                return;
+            }
+        }
+        // 无坐标 -> geocode
+        geocodeAndApply(name, tip.district || '');
+    }
+
+    async function geocodeAndApply(keyword, district) {
+        if (typeof checkKey === 'function' && !checkKey()) return;
+        try {
+            const address = district ? `${district}${keyword}` : keyword;
+            const city = getPreferredCity();
+            const url = `https://restapi.amap.com/v3/geocode/geo` +
+                        `?key=${AMAP_WEB_KEY}&address=${encodeURIComponent(address)}` +
+                        (city ? `&city=${encodeURIComponent(city)}` : '');
+            const resp = await fetch(url);
+            const data = await resp.json();
+            if (data.status === '1' && data.geocodes && data.geocodes.length) {
+                const [lng, lat] = data.geocodes[0].location.split(',').map(Number);
+                onPick(L.latLng(lat, lng), keyword);
+            } else {
+                alert('未找到该位置坐标，请换个关键字');
+            }
+        } catch (err) {
+            console.warn('geocode 失败:', err);
+            alert('地理编码失败：' + err.message);
+        }
+    }
+
+    async function fetchTips(keyword) {
+        if (typeof checkKey === 'function' && !checkKey()) return;
+        if (abortCtl) abortCtl.abort();
+        abortCtl = new AbortController();
+        try {
+            const city = getPreferredCity();
+            const center = map.getCenter();
+            const locOrCity = city
+                ? `&city=${encodeURIComponent(city)}&citylimit=true`
+                : `&location=${center.lng.toFixed(6)},${center.lat.toFixed(6)}`;
+            const url = `https://restapi.amap.com/v3/assistant/inputtips` +
+                        `?key=${AMAP_WEB_KEY}` +
+                        `&keywords=${encodeURIComponent(keyword)}` +
+                        locOrCity +
+                        `&datatype=all`;
+            const resp = await fetch(url, { signal: abortCtl.signal });
+            const data = await resp.json();
+            if (data.status !== '1') { hideTips(); return; }
+            const list = (data.tips || []).filter(t => t && t.name).slice(0, 10);
+            renderTips(list);
+        } catch (err) {
+            if (err.name === 'AbortError') return;
+            console.warn('途经点联想失败:', err);
+            hideTips();
+        }
+    }
+
+    inputEl.addEventListener('input', () => {
+        const kw = inputEl.value.trim();
+        clearTimeout(debounceTimer);
+        if (!kw) { hideTips(); return; }
+        debounceTimer = setTimeout(() => fetchTips(kw), 300);
+    });
+
+    inputEl.addEventListener('keydown', (e) => {
+        const active = tipsEl.classList.contains('active') && tips.length > 0;
+        if (e.key === 'ArrowDown' && active) {
+            e.preventDefault();
+            highlight = (highlight + 1) % tips.length;
+            updateHighlight();
+        } else if (e.key === 'ArrowUp' && active) {
+            e.preventDefault();
+            highlight = (highlight - 1 + tips.length) % tips.length;
+            updateHighlight();
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            if (active && highlight >= 0) {
+                pickTip(highlight);
+            } else if (inputEl.value.trim()) {
+                geocodeAndApply(inputEl.value.trim(), '');
+            }
+        }
+    });
+
+    return { fetchTips, hideTips };
+}
+
+// 单独抽出一个"安全 reverseGeocode"小工具
+async function reverseGeocodeIfPossible(latlng) {
+    try {
+        if (typeof reverseGeocode === 'function') {
+            return await reverseGeocode(latlng);
+        }
+    } catch (e) { /* ignore */ }
+    return '';
+}
+
 function clearRoutePolyline() {
     // 先停掉轨迹回放动画
     stopTrackAnim();
+    // 同时停掉实时导航（如有）
+    if (typeof stopNavigation === 'function') stopNavigation({ silent: true });
     if (routePolyline) { map.removeLayer(routePolyline); routePolyline = null; }
     // 公交模式的多段线
     if (transitPolylines.length) {
         transitPolylines.forEach(pl => { try { map.removeLayer(pl); } catch (e) {} });
         transitPolylines = [];
+    }
+    // 多策略备选路线
+    if (alternativePolylines.length) {
+        alternativePolylines.forEach(pl => { try { map.removeLayer(pl); } catch (e) {} });
+        alternativePolylines = [];
+    }
+    alternativeData = [];
+    selectedAlternativeIdx = 0;
+    if (routeAlternativesEl) {
+        routeAlternativesEl.classList.remove('active');
+        routeAlternativesEl.innerHTML = '';
     }
     routeSummaryEl.classList.remove('active');
     routeSummaryEl.innerHTML = '';
@@ -1686,6 +2323,7 @@ function clearRoutePolyline() {
 function clearAllRoute() {
     clearRouteOrigin();
     clearRouteDestination();
+    clearAllWaypoints();
     clearRoutePolyline();
     // 同时清空公交方案列表
     currentTransits = [];
@@ -1721,6 +2359,218 @@ function formatDuration(seconds) {
 }
 
 // 执行路径规划
+// === 多策略对比：渲染主路线 + 备选弱化路线 ===
+function renderMainRoute(idx) {
+    if (!alternativeData || !alternativeData.length) return;
+    selectedAlternativeIdx = Math.max(0, Math.min(idx, alternativeData.length - 1));
+
+    // 移除旧的主线 + 备选线
+    if (routePolyline) { try { map.removeLayer(routePolyline); } catch (e) {} routePolyline = null; }
+    alternativePolylines.forEach(pl => { try { map.removeLayer(pl); } catch (e) {} });
+    alternativePolylines = [];
+
+    const modeColorMap = {
+        driving: '#1E88E5',
+        walking: '#43A047',
+        bicycling: '#FB8C00'
+    };
+
+    // 先画备选（灰底淡色），可点击切换
+    alternativeData.forEach((p, i) => {
+        if (i === selectedAlternativeIdx) return;
+        const pl = L.polyline(p.coords, {
+            color: p.color,
+            weight: 5,
+            opacity: 0.45,
+            dashArray: '8 8',
+            lineJoin: 'round',
+            lineCap: 'round'
+        }).addTo(map);
+        // 鼠标悬停高亮
+        pl.on('mouseover', () => pl.setStyle({ opacity: 0.85, weight: 6 }));
+        pl.on('mouseout',  () => pl.setStyle({ opacity: 0.45, weight: 5 }));
+        // 点击切换为主路线
+        pl.on('click', () => renderMainRoute(i));
+        // 提示
+        pl.bindTooltip(
+            `${escapeHtml(p.name)} · ${formatDistance(p.distance)} · ${formatDuration(p.duration)}`,
+            { sticky: true }
+        );
+        alternativePolylines.push(pl);
+    });
+
+    // 主线：蚂蚁线
+    const main = alternativeData[selectedAlternativeIdx];
+    const mainColor = (alternativeData.length > 1) ? main.color : modeColorMap[routeMode];
+    routePolyline = antPath(main.coords, {
+        color: mainColor,
+        pulseColor: '#ffffff',
+        weight: 6,
+        opacity: 0.95,
+        delay: 1200,
+        dashArray: [12, 22],
+        lineJoin: 'round',
+        lineCap: 'round',
+        paused: false,
+        reverse: false,
+        hardwareAccelerated: true
+    }).addTo(map);
+
+    // 缓存坐标供"轨迹回放"使用
+    trackAnimCoords = main.coords.slice();
+    resetTrackAnim();
+
+    // 摘要
+    const modeLabel = { driving: '驾车', walking: '步行', bicycling: '骑行' }[routeMode];
+    const wpInfo = ((routeMode === 'driving' || routeMode === 'walking' || routeMode === 'bicycling') && routeWaypoints.length)
+        ? `<div class="summary-line" style="color:#8E24AA;">途经点：${routeWaypoints.length} 个${routeMode !== 'driving' ? '（分段拼接）' : ''}</div>`
+        : '';
+    routeSummaryEl.innerHTML =
+        `<div class="summary-line"><b>${modeLabel}路线</b></div>` +
+        `<div class="summary-line">距离：<span class="distance">${formatDistance(main.distance)}</span></div>` +
+        `<div class="summary-line">预计耗时：${formatDuration(main.duration)}</div>` +
+        (main.strategyText ? `<div class="summary-line" style="color:#888;">策略：${escapeHtml(main.strategyText)}</div>` : '') +
+        wpInfo +
+        `<div class="summary-line track-anim-bar" style="margin-top:8px;display:flex;align-items:center;flex-wrap:wrap;gap:6px;">
+            <button id="track-play-btn" style="padding:3px 10px;font-size:12px;border:1px solid #1E88E5;background:#fff;color:#1E88E5;border-radius:3px;cursor:pointer;">▶️ 播放</button>
+            <button id="track-reset-btn" style="padding:3px 10px;font-size:12px;border:1px solid #888;background:#fff;color:#555;border-radius:3px;cursor:pointer;">⟲ 重放</button>
+            <label style="font-size:11px;color:#666;">速度
+                <select id="track-speed-select" style="font-size:11px;">
+                    <option value="60">🐢 慢 (60 m/s)</option>
+                    <option value="200" selected>🚗 正常 (200 m/s)</option>
+                    <option value="600">🚀 快 (600 m/s)</option>
+                    <option value="1500">⚡ 极速 (1500 m/s)</option>
+                </select>
+            </label>
+            <label style="font-size:11px;color:#666;display:inline-flex;align-items:center;gap:3px;">
+                <input type="checkbox" id="track-follow-checkbox" style="margin:0;"> 📷 跟随
+            </label>
+            <span id="track-progress-text" style="font-size:11px;color:#888;">0%</span>
+        </div>` +
+        // ============ 实时导航入口（仅 driving / walking / bicycling） ============
+        `<div class="nav-launch-row">
+            <button class="nav-real-btn" id="nav-start-real-btn">🧭 开始导航</button>
+            <button class="nav-sim-btn"  id="nav-start-sim-btn">🎮 模拟导航</button>
+            <button class="nav-history-btn" id="nav-history-open-btn" title="导航历史记录">📜</button>
+        </div>`;
+    setTimeout(bindTrackAnimControls, 0);
+    setTimeout(bindNavLaunchControls, 0);
+
+    // 同步候选卡片高亮
+    if (routeAlternativesEl) {
+        routeAlternativesEl.querySelectorAll('.alt-item').forEach((el, i) => {
+            el.classList.toggle('active', i === selectedAlternativeIdx);
+        });
+    }
+}
+
+// 渲染候选方案卡片列表（仅当超过 1 条路径时显示）
+function renderRouteAlternatives() {
+    if (!routeAlternativesEl) return;
+    if (!alternativeData || alternativeData.length <= 1) {
+        routeAlternativesEl.classList.remove('active');
+        routeAlternativesEl.innerHTML = '';
+        return;
+    }
+    routeAlternativesEl.classList.add('active');
+    const html = [`<div class="alt-title">🆚 ${alternativeData.length} 条候选路线（点击切换主路线）</div>`];
+    alternativeData.forEach((p, i) => {
+        html.push(`
+            <div class="alt-item ${i === selectedAlternativeIdx ? 'active' : ''}" data-idx="${i}">
+                <span class="alt-color" style="background:${p.color};"></span>
+                <div class="alt-info">
+                    <div class="alt-name">${escapeHtml(p.name)}</div>
+                    <div class="alt-meta">${formatDistance(p.distance)} · ${formatDuration(p.duration)}</div>
+                </div>
+            </div>
+        `);
+    });
+    routeAlternativesEl.innerHTML = html.join('');
+    routeAlternativesEl.querySelectorAll('.alt-item').forEach(el => {
+        el.addEventListener('click', () => {
+            const i = parseInt(el.getAttribute('data-idx'), 10);
+            if (!isNaN(i)) renderMainRoute(i);
+        });
+    });
+}
+
+// ============== 步行 / 骑行的"分段拼接式途径点"工具函数 ==============
+// 高德 walking / bicycling 接口本身不支持 waypoints 参数，
+// 这里把 [起点, wp1, wp2, ..., 终点] 拆成 N+1 段独立调用，
+// 把每段的 polyline / distance / duration 累加合并成一条整路径。
+//
+// 注意：
+//  - 并发调用 fetch（Promise.all），避免顺序串行拖慢响应；
+//  - 段间衔接处会有重复点，做去重以避免动画"原地停顿"；
+//  - 任何一段失败 -> 抛错，由上层 catch 统一处理。
+async function planRouteWithWaypointsSegmented(mode, origin, dest, waypoints) {
+    // 构造点序列：起点 + 途经点 + 终点
+    const pts = [origin, ...waypoints, dest];
+
+    // 单段请求构造器
+    const fetchOneSegment = async (a, b) => {
+        const o = `${a.lng.toFixed(6)},${a.lat.toFixed(6)}`;
+        const d = `${b.lng.toFixed(6)},${b.lat.toFixed(6)}`;
+        let url, isV4 = false;
+        if (mode === 'walking') {
+            url = `https://restapi.amap.com/v3/direction/walking` +
+                  `?key=${AMAP_WEB_KEY}&origin=${o}&destination=${d}&output=JSON`;
+        } else { // bicycling
+            isV4 = true;
+            url = `https://restapi.amap.com/v4/direction/bicycling` +
+                  `?key=${AMAP_WEB_KEY}&origin=${o}&destination=${d}`;
+        }
+        const resp = await fetch(url);
+        const data = await resp.json();
+        let path;
+        if (isV4) {
+            if (data.errcode !== 0) throw new Error(data.errmsg || '骑行段规划失败');
+            path = (data.data && data.data.paths && data.data.paths[0]);
+        } else {
+            if (data.status !== '1') throw new Error(data.info || '步行段规划失败');
+            path = (data.route && data.route.paths && data.route.paths[0]);
+        }
+        if (!path) throw new Error('某段路径无结果');
+        const coords = [];
+        (path.steps || []).forEach(step => {
+            coords.push(...parseAmapPolyline(step.polyline));
+        });
+        return {
+            coords,
+            distance: Number(path.distance) || 0,
+            duration: Number(path.duration) || 0
+        };
+    };
+
+    // 并发拉所有段
+    const tasks = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+        tasks.push(fetchOneSegment(pts[i], pts[i + 1]));
+    }
+    const segs = await Promise.all(tasks);
+
+    // 拼接 coords：相邻段尾点 / 头点重合时只保留一个
+    const merged = [];
+    let totalDist = 0, totalDur = 0;
+    segs.forEach((seg, idx) => {
+        totalDist += seg.distance;
+        totalDur += seg.duration;
+        if (!seg.coords.length) return;
+        if (idx === 0) {
+            merged.push(...seg.coords);
+        } else {
+            const last = merged[merged.length - 1];
+            const first = seg.coords[0];
+            // 距离 < 1m 视为同点 -> 跳过首点
+            const dup = last && first && Math.abs(last[0] - first[0]) < 1e-5
+                                       && Math.abs(last[1] - first[1]) < 1e-5;
+            merged.push(...(dup ? seg.coords.slice(1) : seg.coords));
+        }
+    });
+
+    return { coords: merged, distance: totalDist, duration: totalDur };
+}
+
 async function planRoute() {
     if (!routeOrigin || !routeDestination) {
         alert('请先设置起点和终点（右键地图选择）');
@@ -1742,12 +2592,42 @@ async function planRoute() {
     const originStr = `${routeOrigin.lng.toFixed(6)},${routeOrigin.lat.toFixed(6)}`;
     const destStr = `${routeDestination.lng.toFixed(6)},${routeDestination.lat.toFixed(6)}`;
 
+    // 仅 driving 支持原生 waypoints / strategy；walking/bicycling 用前端分段拼接
+    const isDriving = routeMode === 'driving';
+    const waypointsStr = (isDriving && routeWaypoints.length)
+        ? routeWaypoints.map(w => `${w.lng.toFixed(6)},${w.lat.toFixed(6)}`).join(';')
+        : '';
+    const strategy = isDriving ? (routeStrategy || '0') : null;
+    const isMultiStrategy = isDriving && strategy === '5';
+
     try {
+        // ===== 步行 / 骑行：有途经点 -> 走"前端分段拼接"分支 =====
+        if (!isDriving && routeWaypoints.length > 0) {
+            const merged = await planRouteWithWaypointsSegmented(routeMode, routeOrigin, routeDestination, routeWaypoints);
+            alternativeData = [{
+                coords: merged.coords,
+                distance: merged.distance,
+                duration: merged.duration,
+                strategyText: `${routeMode === 'walking' ? '步行' : '骑行'} · ${routeWaypoints.length} 个途经点（分段拼接）`,
+                color: '#1E88E5',
+                name: routeMode === 'walking' ? '步行方案' : '骑行方案'
+            }];
+            selectedAlternativeIdx = 0;
+            renderRouteAlternatives();
+            renderMainRoute(0);
+            const allBounds = L.latLngBounds(merged.coords);
+            if (allBounds.isValid()) map.fitBounds(allBounds, { padding: [60, 60] });
+            return;
+        }
+
         let url, apiVersion;
-        if (routeMode === 'driving') {
+        if (isDriving) {
             apiVersion = 'v3';
+            // strategy=5 时高德会返回多条 paths（速度 / 距离 / 不走高速 等组合）
             url = `https://restapi.amap.com/v3/direction/driving` +
-                  `?key=${AMAP_WEB_KEY}&origin=${originStr}&destination=${destStr}&extensions=base&output=JSON`;
+                  `?key=${AMAP_WEB_KEY}&origin=${originStr}&destination=${destStr}` +
+                  `&extensions=base&output=JSON&strategy=${strategy}` +
+                  (waypointsStr ? `&waypoints=${encodeURIComponent(waypointsStr)}` : '');
         } else if (routeMode === 'walking') {
             apiVersion = 'v3';
             url = `https://restapi.amap.com/v3/direction/walking` +
@@ -1761,90 +2641,50 @@ async function planRoute() {
         const resp = await fetch(url);
         const data = await resp.json();
 
-        // v3 和 v4 的响应结构不同，需要分开处理
-        let path, distance, duration, strategy;
+        // v3 / v4 响应结构不同
+        let paths = []; // [{ distance, duration, steps, strategy }]
         if (apiVersion === 'v4') {
-            // v4: { errcode: 0, data: { paths: [{ steps, distance, duration }] } }
             if (data.errcode !== 0) throw new Error(data.errmsg || '骑行规划失败');
-            path = data.data && data.data.paths && data.data.paths[0];
-            if (!path) throw new Error('未找到可用骑行路径');
-            distance = path.distance;
-            duration = path.duration;
+            const all = (data.data && data.data.paths) || [];
+            if (!all.length) throw new Error('未找到可用骑行路径');
+            paths = all.slice(0, 1);
         } else {
-            // v3: { status: "1", route: { paths: [{ steps, distance, duration, strategy }] } }
             if (data.status !== '1') throw new Error(data.info || '路径规划失败');
-            path = data.route && data.route.paths && data.route.paths[0];
-            if (!path) throw new Error('未找到可用路径');
-            distance = path.distance;
-            duration = path.duration;
-            strategy = path.strategy;
+            const all = (data.route && data.route.paths) || [];
+            if (!all.length) throw new Error('未找到可用路径');
+            // 多策略对比时最多取 3 条
+            paths = isMultiStrategy ? all.slice(0, 3) : all.slice(0, 1);
         }
 
-        // 汇总所有 step 的 polyline
-        const allCoords = [];
-        (path.steps || []).forEach(step => {
-            const pts = parseAmapPolyline(step.polyline);
-            // 避免相邻 step 接头重复点导致视觉无影响，但这里保留不影响绘制
-            allCoords.push(...pts);
-        });
+        // 把每条 path 拍平成 coords + meta
+        const pathInfos = paths.map((p, i) => {
+            const coords = [];
+            (p.steps || []).forEach(step => {
+                coords.push(...parseAmapPolyline(step.polyline));
+            });
+            return {
+                coords,
+                distance: Number(p.distance) || 0,
+                duration: Number(p.duration) || 0,
+                strategyText: p.strategy || '',
+                color: ALT_COLORS[i] || '#1E88E5',
+                name: p.strategy || `方案 ${i + 1}`
+            };
+        }).filter(p => p.coords.length >= 2);
 
-        if (allCoords.length < 2) {
-            throw new Error('路径数据为空');
-        }
+        if (!pathInfos.length) throw new Error('路径数据为空');
 
-        // 绘制 polyline（蚂蚁线：流动效果）
-        const modeColorMap = {
-            driving: '#1E88E5',
-            walking: '#43A047',
-            bicycling: '#FB8C00'
-        };
-        routePolyline = antPath(allCoords, {
-            color: modeColorMap[routeMode],
-            pulseColor: '#ffffff',
-            weight: 6,
-            opacity: 0.9,
-            delay: 1200,                 // 流动动画周期（ms）
-            dashArray: [12, 22],         // 虚线样式：[实, 空]
-            lineJoin: 'round',
-            lineCap: 'round',
-            paused: false,
-            reverse: false,
-            hardwareAccelerated: true
-        }).addTo(map);
+        alternativeData = pathInfos;
+        // 若上次记忆的 idx 越界，重置为 0
+        if (selectedAlternativeIdx >= alternativeData.length) selectedAlternativeIdx = 0;
 
-        // 缓存坐标供"轨迹回放"使用
-        trackAnimCoords = allCoords.slice();
-        // 重置回放状态，并预计算总长度
-        resetTrackAnim();
+        renderRouteAlternatives();   // 渲染候选卡片
+        renderMainRoute(selectedAlternativeIdx);  // 绘制主路线 + 摘要
 
-        // 自适应缩放到整条路径
-        map.fitBounds(routePolyline.getBounds(), { padding: [60, 60] });
-
-        // 展示摘要
-        const modeLabel = { driving: '驾车', walking: '步行', bicycling: '骑行' }[routeMode];
-        routeSummaryEl.innerHTML =
-            `<div class="summary-line"><b>${modeLabel}路线</b></div>` +
-            `<div class="summary-line">距离：<span class="distance">${formatDistance(distance)}</span></div>` +
-            `<div class="summary-line">预计耗时：${formatDuration(duration)}</div>` +
-            (strategy ? `<div class="summary-line" style="color:#888;">策略：${escapeHtml(strategy)}</div>` : '') +
-            `<div class="summary-line track-anim-bar" style="margin-top:8px;display:flex;align-items:center;flex-wrap:wrap;gap:6px;">
-                <button id="track-play-btn" style="padding:3px 10px;font-size:12px;border:1px solid #1E88E5;background:#fff;color:#1E88E5;border-radius:3px;cursor:pointer;">▶️ 播放</button>
-                <button id="track-reset-btn" style="padding:3px 10px;font-size:12px;border:1px solid #888;background:#fff;color:#555;border-radius:3px;cursor:pointer;">⟲ 重放</button>
-                <label style="font-size:11px;color:#666;">速度
-                    <select id="track-speed-select" style="font-size:11px;">
-                        <option value="60">🐢 慢 (60 m/s)</option>
-                        <option value="200" selected>🚗 正常 (200 m/s)</option>
-                        <option value="600">🚀 快 (600 m/s)</option>
-                        <option value="1500">⚡ 极速 (1500 m/s)</option>
-                    </select>
-                </label>
-                <label style="font-size:11px;color:#666;display:inline-flex;align-items:center;gap:3px;">
-                    <input type="checkbox" id="track-follow-checkbox" style="margin:0;"> 📷 跟随
-                </label>
-                <span id="track-progress-text" style="font-size:11px;color:#888;">0%</span>
-            </div>`;
-        // 绑定播放/重置/速度事件（延迟到下一 tick，确保 DOM 已插入）
-        setTimeout(bindTrackAnimControls, 0);
+        // 自适应缩放
+        const allBounds = L.latLngBounds([]);
+        alternativeData.forEach(p => p.coords.forEach(c => allBounds.extend(c)));
+        if (allBounds.isValid()) map.fitBounds(allBounds, { padding: [60, 60] });
 
     } catch (err) {
         console.error('路径规划失败:', err);
@@ -2100,10 +2940,71 @@ routeModeBtns.forEach(btn => {
             // 切出公交，隐藏方案列表
             routeTransitsEl.classList.remove('active');
         }
+        // 仅 driving 模式显示策略行
+        if (routeMode === 'driving') {
+            routeStrategyWrapEl.classList.add('active');
+        } else {
+            routeStrategyWrapEl.classList.remove('active');
+        }
+        // 重渲染途经点 UI（非 driving 时途经点列表会隐藏，但状态保留）
+        renderWaypointsUI();
+        // 同步途经点搜索框可见性（公交模式隐藏）
+        if (typeof refreshWaypointSearchVisibility === 'function') {
+            refreshWaypointSearchVisibility();
+        }
+        // 切到非 driving 时，备选路线对比卡片也隐藏
+        if (routeMode !== 'driving' && routeAlternativesEl) {
+            routeAlternativesEl.classList.remove('active');
+        }
         // 如果已经有起终点，自动重新规划
         if (routeOrigin && routeDestination) planRoute();
     });
 });
+
+// 驾车策略改变
+if (routeStrategySelect) {
+    routeStrategySelect.addEventListener('change', () => {
+        routeStrategy = routeStrategySelect.value || '0';
+        if (routeMode === 'driving' && routeOrigin && routeDestination) planRoute();
+    });
+}
+
+// "添加途经点"按钮：右键菜单是主入口；这里点击给一个引导提示
+if (addWaypointBtn) {
+    addWaypointBtn.addEventListener('click', () => {
+        if (routeMode === 'transit') {
+            alert('途经点在公交模式下不支持');
+            return;
+        }
+        if (routeWaypoints.length >= ROUTE_WAYPOINT_LIMIT) {
+            alert(`最多 ${ROUTE_WAYPOINT_LIMIT} 个途经点`);
+            return;
+        }
+        alert('请在地图上 →【右键】→ 选择「🟣 设为途经点」即可添加');
+    });
+}
+
+// 途经点列表的事件委托：上移 / 下移 / 删除 / 编辑
+if (routeWaypointsEl) {
+    routeWaypointsEl.addEventListener('click', (e) => {
+        const wrap = e.target.closest('.waypoint-item');
+        if (!wrap) return;
+        const idx = parseInt(wrap.getAttribute('data-idx'), 10);
+        if (isNaN(idx)) return;
+        const act = e.target.getAttribute('data-act');
+        if (act === 'del') removeWaypoint(idx);
+        else if (act === 'up') moveWaypoint(idx, -1);
+        else if (act === 'down') moveWaypoint(idx, +1);
+        else if (act === 'edit') enterWaypointEdit(idx);
+    });
+}
+
+// 初始化策略行可见性（默认 driving）
+if (routeStrategyWrapEl && routeMode === 'driving') {
+    routeStrategyWrapEl.classList.add('active');
+}
+renderWaypointsUI();
+setupWaypointSearchPanel();
 
 // 城市输入改变后，若当前是公交模式且起终点完备，按回车或失焦触发重新规划
 [routeCityInput, routeCitydInput].forEach(inp => {
@@ -2150,7 +3051,12 @@ function createRoutePointInputController(kind) {
         setTimeout(() => {
             inputEl.focus();
             inputEl.select();
-            if (inputEl.value.trim()) fetchTips(inputEl.value.trim());
+            if (inputEl.value.trim()) {
+                fetchTips(inputEl.value.trim());
+            } else {
+                // 空输入也展示一下"📍 我的位置"项
+                renderTips([]);
+            }
         }, 0);
     }
 
@@ -2168,14 +3074,25 @@ function createRoutePointInputController(kind) {
     }
 
     function renderTips(list) {
-        tips = list;
+        // 永远把"📍 我的位置"作为第 0 项；后面再跟搜索结果
+        const myItem = {
+            __myLocation: true,
+            name: myLocationCache ? `📍 我的位置（${myLocationCache.name || '已定位'}）` : '📍 使用我的当前位置',
+            district: myLocationCache && myLocationCache.source === 'ip' ? 'IP 粗略定位' : '点击使用浏览器精确定位'
+        };
+        const merged = [myItem, ...(list || [])];
+        tips = merged;
         highlight = -1;
-        if (!list || !list.length) {
-            tipsEl.innerHTML = '<div class="route-tip-empty">无匹配结果</div>';
-            tipsEl.classList.add('active');
-            return;
-        }
-        tipsEl.innerHTML = list.map((t, i) => {
+        tipsEl.innerHTML = merged.map((t, i) => {
+            if (t.__myLocation) {
+                return `<div class="route-tip-item my-location" data-index="${i}" title="使用当前定位">
+                    <span class="tip-icon">📍</span>
+                    <span class="tip-body">
+                        <span class="tip-name">${escapeHtml(t.name)}</span>
+                        <span class="tip-district">${escapeHtml(t.district)}</span>
+                    </span>
+                </div>`;
+            }
             const district = [t.district, t.address].filter(Boolean).join(' · ');
             const info = classifyTip(t);
             return `<div class="route-tip-item" data-index="${i}" title="${escapeHtml(info.label)}">
@@ -2186,6 +3103,10 @@ function createRoutePointInputController(kind) {
                 </span>
             </div>`;
         }).join('');
+        // 若没搜索结果且不是空输入态，加一句无匹配提示
+        if ((!list || !list.length) && inputEl.value.trim()) {
+            tipsEl.innerHTML += '<div class="route-tip-empty">无匹配结果</div>';
+        }
         tipsEl.classList.add('active');
         tipsEl.querySelectorAll('.route-tip-item').forEach(el => {
             el.addEventListener('mousedown', (e) => {
@@ -2207,6 +3128,22 @@ function createRoutePointInputController(kind) {
     function pickTip(idx) {
         const tip = tips[idx];
         if (!tip) return;
+        // "📍 我的位置" 特殊项
+        if (tip.__myLocation) {
+            // 缓存命中直接用，否则触发一次定位
+            (myLocationCache
+                ? Promise.resolve(myLocationCache)
+                : getMyLocation({ fresh: true })
+            ).then(loc => {
+                if (!loc) {
+                    alert('无法获取当前位置：浏览器定位被拒绝且 IP 定位失败');
+                    return;
+                }
+                applyPoint(loc.latlng, loc.name);
+                exitEdit();
+            });
+            return;
+        }
         const name = tip.name || '';
         // 有坐标直接用
         if (tip.location && typeof tip.location === 'string' && tip.location.includes(',')) {
@@ -2294,7 +3231,11 @@ function createRoutePointInputController(kind) {
     inputEl.addEventListener('input', () => {
         const kw = inputEl.value.trim();
         clearTimeout(debounceTimer);
-        if (!kw) { hideTips(); return; }
+        if (!kw) {
+            // 清空时仍展示"📍 我的位置"固定项
+            renderTips([]);
+            return;
+        }
         debounceTimer = setTimeout(() => fetchTips(kw), 300);
     });
 
@@ -2483,6 +3424,11 @@ contextMenuEl.addEventListener('click', async (e) => {
                     );
                 }
             }
+            break;
+        }
+        case 'set-waypoint': {
+            // 添加途经点（驾车=原生 waypoints；步行/骑行=前端分段拼接；公交不支持）
+            await addRouteWaypoint(latlng, '');
             break;
         }
         case 'copy-coord': {
@@ -2790,6 +3736,17 @@ drawerAsDestBtn.addEventListener('click', () => {
         setRouteDestination(currentDrawerLatLng, currentDrawerPoi.name || '');
     }
 });
+
+// C: POI 抽屉"设为途经点"按钮
+const drawerAsWaypointBtn = document.getElementById('drawer-as-waypoint');
+if (drawerAsWaypointBtn) {
+    drawerAsWaypointBtn.addEventListener('click', () => {
+        if (currentDrawerLatLng && currentDrawerPoi) {
+            // addRouteWaypoint 内部已自动处理：上限校验、提示、自动重规划
+            addRouteWaypoint(currentDrawerLatLng, currentDrawerPoi.name || '');
+        }
+    });
+}
 
 // Esc 关闭抽屉/灯箱
 document.addEventListener('keydown', (e) => {
@@ -5635,3 +6592,831 @@ map.addControl(new DrawnDrawerToggle());
 // 启动：恢复绘制图形 + 给已恢复图层绑 popup（bindDrawnLayerPopup 在恢复内部已调用）
 // ============================================================================
 restoreDrawnLayersFromStorage();
+
+
+// ============================================================================
+// ============================================================================
+//
+//                  🧭 实时骑行 / 驾车 / 步行 导航模块（拟真版 C）
+//
+//   特性：
+//     1) 「开始导航」：启动 navigator.geolocation.watchPosition 真实位置流
+//     2) 「模拟导航」：requestAnimationFrame 沿路径推进，速度可调（不需要真位置）
+//     3) 当前位置投影到路径折线（点到折线最短距离），算出"已走 N 米"
+//     4) 已走部分变灰、待行部分高亮，箭头 marker 沿路径前进
+//     5) 顶部 HUD：剩余距离/剩余时间/速度/转向提示/进度条
+//     6) 偏航检测（>50m）→ 自动重新规划
+//     7) 到达检测：进入终点 30m 内 → 完成弹窗 + 写入历史记录（localStorage）
+//     8) 转向提示：基于路径几何检测下一个转弯点，给出 ⬆️↗️↘️ 方向 + 距离
+//     9) 第一视角（可选）：跟随用户位置 + 头部朝向行进方向
+//
+//   状态机：IDLE → RUNNING → (PAUSED) → FINISHED / STOPPED
+// ============================================================================
+
+// 兜底 toast：项目里如果已有 showToast 就复用；没有就在这里定义
+if (typeof window.showToast !== 'function') {
+    window.showToast = function (msg, type) {
+        const div = document.createElement('div');
+        div.style.cssText = `
+            position:fixed;top:80px;left:50%;transform:translateX(-50%);
+            background:${type === 'error' ? '#E53935' : type === 'warn' ? '#FB8C00' : type === 'success' ? '#43A047' : '#1E88E5'};
+            color:#fff;padding:8px 18px;border-radius:6px;z-index:3000;
+            font-size:13px;box-shadow:0 4px 14px rgba(0,0,0,.25);
+            transition:opacity .3s;`;
+        div.textContent = msg;
+        document.body.appendChild(div);
+        setTimeout(() => { div.style.opacity = '0'; }, 2000);
+        setTimeout(() => { try { div.remove(); } catch(_) {} }, 2400);
+    };
+}
+const showToast = window.showToast;
+
+// -------------------- 模块级状态 --------------------
+let navState = 'IDLE';                    // IDLE | RUNNING | PAUSED | FINISHED
+let navMode  = 'real';                    // real | sim
+let navCoords = null;                     // 当前路径 [[lat,lng],...]
+let navTotalDist = 0;                     // 路径总长（米）
+let navTotalDur  = 0;                     // 路径总时长（秒，接口给的）
+let navOriginInfo = null;                 // { lat, lng, name }
+let navDestInfo   = null;                 // { lat, lng, name }
+let navTransport  = 'bicycling';          // 启动时记下 routeMode 快照
+let navWatchId = null;                    // geolocation.watchPosition id
+let navSimRafId = null;                   // requestAnimationFrame id
+let navSimPrevTs = 0;                     // 模拟模式上一帧时间戳
+let navSimSpeedKmh = 15;                  // 模拟速度（km/h），可由滑块调
+let navWalkedDist = 0;                    // 已走累计距离（米）
+let navCurLatLng = null;                  // 当前投影后的位置 [lat,lng]
+let navMaxSpeed = 0;                      // 历史最高速度（m/s）
+let navStartTime = 0;                     // 起始毫秒时间戳
+let navPausedAccum = 0;                   // 暂停累计毫秒
+let navPausedAt = 0;                      // 当前暂停起始时间戳
+let navFollowCamera = true;               // 是否相机跟随
+let navTraveledLine = null;               // 已走的灰色折线
+let navAheadLine    = null;               // 待行的高亮折线
+let navArrowMarker  = null;               // 行进箭头 marker
+let navOffroutePoly = null;               // 偏航连接线（用户位置→最近路径点）
+let navReplanCooldown = 0;                // 偏航重规划冷却（毫秒时间戳）
+let navLastSpeed = 0;                     // 最近一次速度（m/s），用于估剩余时间
+let navMaxHistory = 30;                   // localStorage 最多保留多少条记录
+const NAV_HISTORY_KEY = 'leaflet_demo_nav_history_v1';
+
+// -------------------- 工具函数 --------------------
+
+// 米制 Haversine（Leaflet 自带 distance 走的是 Vincenty 形式，平面应用上等价；这里复用）
+function navHaversine(a, b) {
+    return map.distance(a, b);  // 返回米
+}
+
+/**
+ * 把点 p 投影到由 [a, b] 组成的线段上，返回：
+ *   { lat, lng } 投影点
+ *   t          归一化参数 [0,1]
+ *   dist       p 到投影点的距离（米）
+ */
+function navProjectOnSegment(p, a, b) {
+    // 用本地切平面线性近似（数百米尺度足够），再用 map.distance 修正距离
+    const ax = a[1], ay = a[0]; // lng, lat
+    const bx = b[1], by = b[0];
+    const px = p[1], py = p[0];
+    const dx = bx - ax, dy = by - ay;
+    const lenSq = dx * dx + dy * dy;
+    let t;
+    if (lenSq < 1e-14) t = 0;
+    else t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+    t = Math.max(0, Math.min(1, t));
+    const projLat = ay + dy * t;
+    const projLng = ax + dx * t;
+    const proj = [projLat, projLng];
+    return { lat: projLat, lng: projLng, t, dist: navHaversine(p, proj), proj };
+}
+
+/**
+ * 把点 p 投影到整条折线 coords 上，找到最近段。
+ * 返回：{ segIdx, t, dist, traveled } —— traveled = 起点到投影点的累计米数
+ */
+function navProjectOnPolyline(p, coords) {
+    let best = null;
+    let cumulative = 0;
+    for (let i = 0; i < coords.length - 1; i++) {
+        const a = coords[i], b = coords[i + 1];
+        const segLen = navHaversine(a, b);
+        const r = navProjectOnSegment(p, a, b);
+        if (best === null || r.dist < best.dist) {
+            best = {
+                segIdx: i,
+                t: r.t,
+                dist: r.dist,
+                proj: r.proj,
+                traveled: cumulative + segLen * r.t
+            };
+        }
+        cumulative += segLen;
+    }
+    return best;
+}
+
+// 计算整条折线总长度
+function navPolylineLength(coords) {
+    let s = 0;
+    for (let i = 0; i < coords.length - 1; i++) s += navHaversine(coords[i], coords[i + 1]);
+    return s;
+}
+
+// 把折线在 traveled 米处一切两半 -> { walked: [...], ahead: [...] }
+function navSplitPolyline(coords, traveled) {
+    const walked = [];
+    const ahead  = [];
+    let acc = 0;
+    let split = false;
+    for (let i = 0; i < coords.length - 1; i++) {
+        const a = coords[i], b = coords[i + 1];
+        const segLen = navHaversine(a, b);
+        if (!split && acc + segLen >= traveled) {
+            const t = segLen > 1e-6 ? (traveled - acc) / segLen : 0;
+            const lat = a[0] + (b[0] - a[0]) * t;
+            const lng = a[1] + (b[1] - a[1]) * t;
+            walked.push(a, [lat, lng]);
+            ahead.push([lat, lng], b);
+            split = true;
+        } else if (!split) {
+            walked.push(a);
+            if (i === coords.length - 2) walked.push(b);
+        } else {
+            if (ahead.length === 0) ahead.push(a);
+            ahead.push(b);
+        }
+        acc += segLen;
+    }
+    if (!split) {
+        // 还没开始 / 全部已走
+        if (traveled <= 0) return { walked: [], ahead: coords.slice() };
+        else return { walked: coords.slice(), ahead: [] };
+    }
+    return { walked, ahead };
+}
+
+// 在 traveled 米处取得该位置的方向角（航向，单位：度，0=正北，90=正东）
+function navBearingAt(coords, traveled) {
+    let acc = 0;
+    for (let i = 0; i < coords.length - 1; i++) {
+        const a = coords[i], b = coords[i + 1];
+        const segLen = navHaversine(a, b);
+        if (acc + segLen >= traveled || i === coords.length - 2) {
+            return navBearing(a, b);
+        }
+        acc += segLen;
+    }
+    return 0;
+}
+
+// 两点航向角（度，0=北 顺时针）
+function navBearing(a, b) {
+    const φ1 = a[0] * Math.PI / 180;
+    const φ2 = b[0] * Math.PI / 180;
+    const Δλ = (b[1] - a[1]) * Math.PI / 180;
+    const y = Math.sin(Δλ) * Math.cos(φ2);
+    const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+/**
+ * 找到下一个"显著拐弯"点：从 traveled 米处往前扫，
+ * 累计偏航 > 30° 的最近一处节点 -> 返回 { distAhead, turnAngle }
+ * 没有则返回 null（说明前方近距离基本是直行）
+ */
+function navFindNextTurn(coords, traveled, lookahead = 800) {
+    let acc = 0;
+    let baseBearing = null;
+    let scanned = 0;
+
+    // 先定位到 traveled 所在 segIdx
+    let startIdx = 0;
+    let leftover = traveled;
+    for (let i = 0; i < coords.length - 1; i++) {
+        const segLen = navHaversine(coords[i], coords[i + 1]);
+        if (leftover <= segLen) { startIdx = i; break; }
+        leftover -= segLen;
+    }
+    baseBearing = navBearing(coords[startIdx], coords[startIdx + 1]);
+
+    for (let i = startIdx + 1; i < coords.length - 1; i++) {
+        const segLen = navHaversine(coords[i], coords[i + 1]);
+        const newBearing = navBearing(coords[i], coords[i + 1]);
+        let diff = ((newBearing - baseBearing + 540) % 360) - 180; // [-180,180]
+        if (Math.abs(diff) > 30) {
+            // 这个节点是个拐弯
+            const distAhead = scanned + (navHaversine(coords[startIdx], coords[startIdx + 1]) - leftover);
+            return {
+                distAhead: Math.max(0, scanned),
+                turnAngle: diff,
+                turnLatLng: coords[i]
+            };
+        }
+        scanned += segLen;
+        if (scanned > lookahead) break;
+        baseBearing = newBearing;
+    }
+    return null;
+}
+
+// 把转弯角度转成 emoji + 文字
+function navTurnToEmoji(angle) {
+    const a = angle;
+    if (a > 135 || a < -135) return { icon: '⬇️', text: '请掉头' };
+    if (a > 60)              return { icon: '↘️', text: '右转' };
+    if (a > 20)              return { icon: '↗️', text: '右前方转向' };
+    if (a < -135)            return { icon: '⬇️', text: '请掉头' };
+    if (a < -60)             return { icon: '↙️', text: '左转' };
+    if (a < -20)             return { icon: '↖️', text: '左前方转向' };
+    return { icon: '⬆️', text: '直行' };
+}
+
+// 米 -> 易读字符串
+function navFmtDist(m) {
+    if (m == null || isNaN(m)) return '--';
+    if (m < 1000) return Math.round(m) + ' m';
+    return (m / 1000).toFixed(2) + ' km';
+}
+
+// 秒 -> 易读字符串
+function navFmtDur(s) {
+    if (s == null || isNaN(s) || s < 0) return '--';
+    s = Math.round(s);
+    if (s < 60) return s + ' 秒';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + ' 分';
+    const h = Math.floor(m / 60);
+    return h + ' 时 ' + (m % 60) + ' 分';
+}
+
+// m/s -> km/h 文字
+function navFmtSpeed(mps) {
+    if (mps == null || isNaN(mps)) return '--';
+    return (mps * 3.6).toFixed(1) + ' km/h';
+}
+
+
+// -------------------- 启动入口 --------------------
+
+/**
+ * 在路径摘要里"开始导航 / 模拟导航 / 历史"按钮渲染后绑定事件
+ * （由 renderMainRoute 末尾 setTimeout(bindNavLaunchControls, 0) 触发）
+ */
+function bindNavLaunchControls() {
+    const realBtn = document.getElementById('nav-start-real-btn');
+    const simBtn  = document.getElementById('nav-start-sim-btn');
+    const hisBtn  = document.getElementById('nav-history-open-btn');
+    if (realBtn) realBtn.addEventListener('click', () => startNavigation('real'));
+    if (simBtn)  simBtn.addEventListener('click',  () => startNavigation('sim'));
+    if (hisBtn)  hisBtn.addEventListener('click',  () => openNavHistoryDrawer());
+}
+
+/**
+ * 启动导航
+ *  mode: 'real' | 'sim'
+ */
+function startNavigation(mode) {
+    // 公交模式不支持
+    if (routeMode === 'transit') {
+        alert('🚌 公交模式暂不支持实时导航\n请切换到 🚗 驾车 / 🚶 步行 / 🚴 骑行');
+        return;
+    }
+    if (!alternativeData || !alternativeData.length) {
+        alert('请先规划一条路线');
+        return;
+    }
+    if (navState === 'RUNNING' || navState === 'PAUSED') {
+        if (!confirm('当前正在导航，是否结束当前导航后重新开始？')) return;
+        stopNavigation({ silent: true });
+    }
+
+    const main = alternativeData[selectedAlternativeIdx] || alternativeData[0];
+    navCoords     = main.coords.slice();
+    navTotalDist  = navPolylineLength(navCoords);
+    navTotalDur   = main.duration || 0;
+    navOriginInfo = routeOrigin ? { ...routeOrigin } : null;
+    navDestInfo   = routeDestination ? { ...routeDestination } : null;
+    navTransport  = routeMode;
+    navMode       = mode;
+    navWalkedDist = 0;
+    navMaxSpeed   = 0;
+    navLastSpeed  = 0;
+    navStartTime  = Date.now();
+    navPausedAccum = 0;
+    navPausedAt    = 0;
+    navFollowCamera = true;
+    navState = 'RUNNING';
+
+    // 初始化 HUD
+    showNavHud(true);
+    document.getElementById('nav-hud-pause').textContent = '⏸ 暂停';
+    document.getElementById('nav-hud-sim-row').classList.toggle('active', mode === 'sim');
+    syncSimSpeedSlider();
+
+    // 替换为"已走/待行"双线 + 隐藏蚂蚁线
+    setupNavLayers();
+
+    // 中心定到起点
+    if (navOriginInfo) {
+        navCurLatLng = [navOriginInfo.lat, navOriginInfo.lng];
+        map.setView(navCurLatLng, Math.max(map.getZoom(), 15));
+    } else {
+        navCurLatLng = navCoords[0].slice();
+        map.setView(navCurLatLng, Math.max(map.getZoom(), 15));
+    }
+    updateArrowMarker(navCurLatLng, navBearingAt(navCoords, 0));
+
+    // 启动数据流
+    if (mode === 'sim') {
+        startSimLoop();
+    } else {
+        startRealWatch();
+    }
+
+    // 通用事件绑定（首次）
+    bindHudControlsOnce();
+
+    showToast(mode === 'sim'
+        ? '🎮 模拟导航已启动 — 调节速度滑块体验'
+        : '🧭 实时导航已启动 — 请允许定位授权', 'info');
+}
+
+// 准备双线（已走灰 / 待行高亮）
+function setupNavLayers() {
+    // 隐藏原蚂蚁线（保留对象，结束导航后可恢复）
+    if (routePolyline && map.hasLayer(routePolyline)) {
+        try { map.removeLayer(routePolyline); } catch (_) {}
+    }
+
+    const aheadColor = ({
+        driving:   '#1E88E5',
+        walking:   '#43A047',
+        bicycling: '#FB8C00'
+    })[navTransport] || '#1E88E5';
+
+    if (navTraveledLine) { try { map.removeLayer(navTraveledLine); } catch (_) {} }
+    if (navAheadLine)    { try { map.removeLayer(navAheadLine);    } catch (_) {} }
+
+    navTraveledLine = L.polyline([], {
+        color: '#9e9e9e', weight: 5, opacity: 0.55,
+        lineJoin: 'round', lineCap: 'round'
+    }).addTo(map);
+
+    navAheadLine = L.polyline(navCoords, {
+        color: aheadColor, weight: 6, opacity: 0.95,
+        lineJoin: 'round', lineCap: 'round'
+    }).addTo(map);
+}
+
+// 行进箭头 marker（DivIcon）
+function updateArrowMarker(latlng, bearing) {
+    const html =
+        `<div style="
+            width:28px;height:28px;border-radius:50%;
+            background:#1E88E5;border:3px solid #fff;
+            box-shadow:0 2px 6px rgba(0,0,0,.35);
+            display:flex;align-items:center;justify-content:center;
+            transform:rotate(${bearing}deg);transition:transform 0.3s;">
+            <div style="
+                width:0;height:0;
+                border-left:6px solid transparent;
+                border-right:6px solid transparent;
+                border-bottom:10px solid #fff;
+                margin-bottom:2px;"></div>
+        </div>`;
+    const icon = L.divIcon({
+        className: 'nav-arrow-icon',
+        html, iconSize: [28, 28], iconAnchor: [14, 14]
+    });
+    if (!navArrowMarker) {
+        navArrowMarker = L.marker(latlng, { icon, zIndexOffset: 2000 }).addTo(map);
+    } else {
+        navArrowMarker.setLatLng(latlng);
+        navArrowMarker.setIcon(icon);
+    }
+}
+
+
+// -------------------- 真实位置流 --------------------
+function startRealWatch() {
+    if (!navigator.geolocation) {
+        alert('浏览器不支持定位');
+        stopNavigation({ silent: true });
+        return;
+    }
+    navWatchId = navigator.geolocation.watchPosition(
+        (pos) => {
+            if (navState !== 'RUNNING') return;
+            const { latitude, longitude, speed } = pos.coords;
+            // WGS84 -> GCJ02（与底图一致）
+            const [gcjLng, gcjLat] = CoordTransform.wgs84ToGcj02(longitude, latitude);
+            const userLatLng = [gcjLat, gcjLng];
+            navLastSpeed = (speed != null && !isNaN(speed)) ? speed : 0;
+            if (navLastSpeed > navMaxSpeed) navMaxSpeed = navLastSpeed;
+            advanceNav(userLatLng);
+        },
+        (err) => {
+            console.warn('[nav] watchPosition 错误', err);
+            showToast('⚠️ 定位失败：' + (err.message || err.code), 'warn');
+        },
+        { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 }
+    );
+}
+
+
+// -------------------- 模拟位置流 --------------------
+function startSimLoop() {
+    navSimPrevTs = 0;
+    const tick = (ts) => {
+        if (navState !== 'RUNNING') {
+            navSimRafId = requestAnimationFrame(tick); // 暂停时空转，恢复继续
+            return;
+        }
+        if (!navSimPrevTs) navSimPrevTs = ts;
+        const dt = (ts - navSimPrevTs) / 1000;  // 秒
+        navSimPrevTs = ts;
+        const speedMps = navSimSpeedKmh / 3.6;
+        navLastSpeed = speedMps;
+        if (speedMps > navMaxSpeed) navMaxSpeed = speedMps;
+        const advance = speedMps * dt;
+        const newWalked = Math.min(navWalkedDist + advance, navTotalDist);
+        const userLatLng = sampleLatLngAt(navCoords, newWalked);
+        if (userLatLng) advanceNav(userLatLng, /*forceWalked*/ newWalked);
+        navSimRafId = requestAnimationFrame(tick);
+    };
+    navSimRafId = requestAnimationFrame(tick);
+}
+
+// 在折线 d 米处采样坐标
+function sampleLatLngAt(coords, d) {
+    if (!coords || coords.length < 2) return null;
+    if (d <= 0) return coords[0].slice();
+    let acc = 0;
+    for (let i = 0; i < coords.length - 1; i++) {
+        const a = coords[i], b = coords[i + 1];
+        const seg = navHaversine(a, b);
+        if (acc + seg >= d || i === coords.length - 2) {
+            const t = seg > 1e-6 ? (d - acc) / seg : 1;
+            return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        }
+        acc += seg;
+    }
+    return coords[coords.length - 1].slice();
+}
+
+
+// -------------------- 推进 / 偏航 / 到达 --------------------
+function advanceNav(userLatLng, forceWalked) {
+    if (!navCoords) return;
+    const proj = navProjectOnPolyline(userLatLng, navCoords);
+
+    // 偏航检测（真实模式才做，模拟模式始终在路径上）
+    if (navMode === 'real' && proj.dist > 50) {
+        // 显示偏航连接线
+        if (!navOffroutePoly) {
+            navOffroutePoly = L.polyline([userLatLng, proj.proj], {
+                color: '#E53935', weight: 3, dashArray: '6 6', opacity: 0.85
+            }).addTo(map);
+        } else {
+            navOffroutePoly.setLatLngs([userLatLng, proj.proj]);
+        }
+        // 冷却 8 秒，避免连续重规划
+        const now = Date.now();
+        if (proj.dist > 80 && now > navReplanCooldown) {
+            navReplanCooldown = now + 8000;
+            triggerReplan(userLatLng);
+            return;
+        }
+    } else {
+        if (navOffroutePoly) { try { map.removeLayer(navOffroutePoly); } catch(_) {} navOffroutePoly = null; }
+    }
+
+    // 已走距离：不允许倒退
+    const traveled = forceWalked != null
+        ? forceWalked
+        : Math.max(navWalkedDist, proj.traveled);
+    navWalkedDist = traveled;
+    navCurLatLng  = proj.proj;
+
+    // 双线分割
+    const split = navSplitPolyline(navCoords, traveled);
+    if (navTraveledLine) navTraveledLine.setLatLngs(split.walked);
+    if (navAheadLine)    navAheadLine.setLatLngs(split.ahead);
+
+    // 箭头 marker
+    const bearing = navBearingAt(navCoords, traveled);
+    updateArrowMarker(navCurLatLng, bearing);
+
+    // 相机跟随
+    if (navFollowCamera) {
+        map.panTo(navCurLatLng, { animate: true, duration: 0.4 });
+    }
+
+    // HUD 更新
+    updateHud(traveled, bearing);
+
+    // 到达检测
+    const remain = navTotalDist - traveled;
+    const distToDest = navDestInfo
+        ? navHaversine(navCurLatLng, [navDestInfo.lat, navDestInfo.lng])
+        : remain;
+    if (remain <= 5 || distToDest <= 30) {
+        finishNavigation();
+    }
+}
+
+// 偏航 → 重新规划：把当前位置当作新起点，调一次 planRoute
+async function triggerReplan(userLatLng) {
+    showToast('⚠️ 检测到偏航，正在重新规划路径…', 'warn');
+    try {
+        // 临时改 routeOrigin 为当前位置（不替换 marker，避免视觉跳变）
+        const oldOrigin = routeOrigin;
+        routeOrigin = { lat: userLatLng[0], lng: userLatLng[1], name: '当前位置（偏航）' };
+        await planRoute();
+        // 用新方案重置导航参数（保持 RUNNING 状态）
+        if (alternativeData && alternativeData.length) {
+            const main = alternativeData[selectedAlternativeIdx] || alternativeData[0];
+            navCoords = main.coords.slice();
+            navTotalDist = navPolylineLength(navCoords);
+            navTotalDur  = main.duration || 0;
+            navWalkedDist = 0;
+            setupNavLayers();
+            updateArrowMarker(userLatLng, navBearingAt(navCoords, 0));
+            showToast('✅ 已切换到新路径', 'success');
+        }
+        // 还原 origin（仅显示用，不影响导航）
+        routeOrigin = oldOrigin;
+    } catch (e) {
+        console.error('[nav] 重新规划失败', e);
+        showToast('❌ 重新规划失败：' + (e.message || e), 'error');
+    }
+}
+
+
+// -------------------- HUD 更新 --------------------
+function updateHud(traveled, bearing) {
+    const remain = Math.max(0, navTotalDist - traveled);
+    const ratio  = navTotalDist > 0 ? Math.min(1, traveled / navTotalDist) : 0;
+
+    // 用接口给的总时长按比例剩余 + 当前速度兜底
+    let remainSec;
+    if (navLastSpeed > 0.3) {
+        remainSec = remain / navLastSpeed;
+    } else if (navTotalDur > 0) {
+        remainSec = navTotalDur * (1 - ratio);
+    } else {
+        remainSec = NaN;
+    }
+
+    const turn = navFindNextTurn(navCoords, traveled, 1000);
+    let turnIcon = '⬆️', turnText = '沿当前道路直行';
+    if (turn) {
+        const t = navTurnToEmoji(turn.turnAngle);
+        turnIcon = t.icon;
+        turnText = `${navFmtDist(turn.distAhead)} 后${t.text}`;
+    } else if (remain < 80) {
+        turnIcon = '🏁';
+        turnText = `即将到达终点（${navFmtDist(remain)}）`;
+    }
+
+    const $ = (id) => document.getElementById(id);
+    $('nav-hud-turn-icon').textContent  = turnIcon;
+    $('nav-hud-turn-text').textContent  = turnText;
+    $('nav-hud-remain-dist').textContent = navFmtDist(remain);
+    $('nav-hud-remain-time').textContent = navFmtDur(remainSec);
+    $('nav-hud-speed').textContent       = navFmtSpeed(navLastSpeed);
+    $('nav-hud-progress-bar').style.width = (ratio * 100).toFixed(1) + '%';
+}
+
+
+// -------------------- HUD 控件 --------------------
+let navHudControlsBound = false;
+function bindHudControlsOnce() {
+    if (navHudControlsBound) return;
+    navHudControlsBound = true;
+
+    document.getElementById('nav-hud-recenter').addEventListener('click', () => {
+        navFollowCamera = !navFollowCamera;
+        document.getElementById('nav-hud-recenter').textContent = navFollowCamera ? '📷 跟随' : '📷 自由';
+        if (navFollowCamera && navCurLatLng) map.panTo(navCurLatLng);
+    });
+
+    document.getElementById('nav-hud-pause').addEventListener('click', () => {
+        if (navState === 'RUNNING') {
+            navState = 'PAUSED';
+            navPausedAt = Date.now();
+            document.getElementById('nav-hud-pause').textContent = '▶️ 继续';
+            showToast('⏸ 导航已暂停', 'info');
+        } else if (navState === 'PAUSED') {
+            navState = 'RUNNING';
+            navPausedAccum += Date.now() - navPausedAt;
+            navPausedAt = 0;
+            navSimPrevTs = 0; // 模拟模式重置 dt 基准
+            document.getElementById('nav-hud-pause').textContent = '⏸ 暂停';
+            showToast('▶️ 继续导航', 'info');
+        }
+    });
+
+    document.getElementById('nav-hud-stop').addEventListener('click', () => {
+        if (confirm('确定要结束当前导航吗？')) stopNavigation();
+    });
+
+    // 模拟速度滑块
+    const slider = document.getElementById('nav-hud-sim-speed');
+    const sliderText = document.getElementById('nav-hud-sim-speed-text');
+    slider.addEventListener('input', () => {
+        navSimSpeedKmh = parseInt(slider.value, 10) || 15;
+        sliderText.textContent = navSimSpeedKmh + ' km/h';
+    });
+}
+
+function syncSimSpeedSlider() {
+    const slider = document.getElementById('nav-hud-sim-speed');
+    const sliderText = document.getElementById('nav-hud-sim-speed-text');
+    if (!slider) return;
+    // 不同模式给不同默认速度
+    const def = ({
+        bicycling: 15, walking: 5, driving: 50
+    })[navTransport] || 15;
+    navSimSpeedKmh = def;
+    slider.value = String(def);
+    sliderText.textContent = def + ' km/h';
+}
+
+function showNavHud(show) {
+    const hud = document.getElementById('nav-hud');
+    if (hud) hud.classList.toggle('active', !!show);
+}
+
+
+// -------------------- 结束 / 完成 --------------------
+function stopNavigation(opts = {}) {
+    const wasRunning = (navState === 'RUNNING' || navState === 'PAUSED');
+    navState = 'IDLE';
+
+    if (navWatchId != null) {
+        try { navigator.geolocation.clearWatch(navWatchId); } catch (_) {}
+        navWatchId = null;
+    }
+    if (navSimRafId != null) {
+        try { cancelAnimationFrame(navSimRafId); } catch (_) {}
+        navSimRafId = null;
+    }
+
+    if (navTraveledLine) { try { map.removeLayer(navTraveledLine); } catch(_) {} navTraveledLine = null; }
+    if (navAheadLine)    { try { map.removeLayer(navAheadLine);    } catch(_) {} navAheadLine    = null; }
+    if (navOffroutePoly) { try { map.removeLayer(navOffroutePoly); } catch(_) {} navOffroutePoly = null; }
+    if (navArrowMarker)  { try { map.removeLayer(navArrowMarker);  } catch(_) {} navArrowMarker  = null; }
+
+    showNavHud(false);
+
+    if (wasRunning && !opts.silent) {
+        showToast('⏹ 已结束导航', 'info');
+    }
+}
+
+function finishNavigation() {
+    if (navState !== 'RUNNING' && navState !== 'PAUSED') return;
+    const elapsedMs = Date.now() - navStartTime - navPausedAccum;
+    const elapsedSec = elapsedMs / 1000;
+    const dist = navTotalDist;
+    const avgSpeed = elapsedSec > 0 ? dist / elapsedSec : 0;
+
+    // 写入历史
+    saveNavHistory({
+        ts: Date.now(),
+        mode: navMode,
+        transport: navTransport,
+        origin: navOriginInfo,
+        dest: navDestInfo,
+        distance: Math.round(dist),
+        duration: Math.round(elapsedSec),
+        avgSpeed: avgSpeed,
+        maxSpeed: navMaxSpeed
+    });
+
+    // 弹窗
+    const $ = (id) => document.getElementById(id);
+    $('nav-finish-dist').textContent = navFmtDist(dist);
+    $('nav-finish-time').textContent = navFmtDur(elapsedSec);
+    $('nav-finish-avg').textContent  = navFmtSpeed(avgSpeed);
+    $('nav-finish-max').textContent  = navFmtSpeed(navMaxSpeed);
+    const transportLabel = ({
+        bicycling: '骑行', walking: '步行', driving: '驾车'
+    })[navTransport] || '导航';
+    $('nav-finish-title').textContent =
+        (navMode === 'sim' ? '🎮 模拟' : '🎉 实时') + transportLabel + '完成！';
+    $('nav-finish-mask').classList.add('active');
+
+    // 停掉
+    stopNavigation({ silent: true });
+    navState = 'FINISHED';
+}
+
+// 完成弹窗 OK
+document.addEventListener('DOMContentLoaded', () => {});
+{
+    const finishOkBtn = document.getElementById('nav-finish-ok');
+    if (finishOkBtn) {
+        finishOkBtn.addEventListener('click', () => {
+            document.getElementById('nav-finish-mask').classList.remove('active');
+        });
+    }
+}
+
+
+// -------------------- 历史记录 --------------------
+function loadNavHistory() {
+    try {
+        const raw = localStorage.getItem(NAV_HISTORY_KEY);
+        if (!raw) return [];
+        const arr = JSON.parse(raw);
+        return Array.isArray(arr) ? arr : [];
+    } catch (_) { return []; }
+}
+function saveNavHistory(item) {
+    const arr = loadNavHistory();
+    arr.unshift(item);
+    while (arr.length > navMaxHistory) arr.pop();
+    try { localStorage.setItem(NAV_HISTORY_KEY, JSON.stringify(arr)); } catch (_) {}
+}
+function clearNavHistory() {
+    try { localStorage.removeItem(NAV_HISTORY_KEY); } catch (_) {}
+}
+
+function openNavHistoryDrawer() {
+    renderNavHistoryDrawer();
+    document.getElementById('nav-history-drawer').classList.add('active');
+}
+function closeNavHistoryDrawer() {
+    document.getElementById('nav-history-drawer').classList.remove('active');
+}
+
+function renderNavHistoryDrawer() {
+    const list = loadNavHistory();
+    const body = document.getElementById('nav-history-list');
+    if (!list.length) {
+        body.innerHTML = `<div class="nh-empty">暂无导航记录<br><br>完成一次导航后会自动保存在这里</div>`;
+        return;
+    }
+    const transportEmoji = { bicycling: '🚴', walking: '🚶', driving: '🚗' };
+    const html = list.map((it, idx) => {
+        const date = new Date(it.ts);
+        const dateStr = `${date.getMonth()+1}-${String(date.getDate()).padStart(2,'0')} ${String(date.getHours()).padStart(2,'0')}:${String(date.getMinutes()).padStart(2,'0')}`;
+        const tEmoji = transportEmoji[it.transport] || '📍';
+        const modeTag = it.mode === 'sim' ? '🎮 模拟' : '🧭 实时';
+        const fromName = (it.origin && it.origin.name) || '起点';
+        const toName   = (it.dest   && it.dest.name)   || '终点';
+        return `
+            <div class="nh-item" data-idx="${idx}">
+                <div class="nh-it-title">
+                    <span>${tEmoji} ${escapeHtml(fromName)} → ${escapeHtml(toName)}</span>
+                    <span class="nh-it-mode">${modeTag}</span>
+                </div>
+                <div class="nh-it-line">📅 ${dateStr}</div>
+                <div class="nh-it-line">📏 ${navFmtDist(it.distance)} · ⏱ ${navFmtDur(it.duration)} · ⚡ 平均 ${navFmtSpeed(it.avgSpeed)}</div>
+                <div class="nh-it-actions">
+                    <button data-act="reuse"  data-idx="${idx}">↩️ 复用为路线</button>
+                    <button data-act="delete" data-idx="${idx}" class="danger">🗑 删除</button>
+                </div>
+            </div>`;
+    }).join('');
+    body.innerHTML = html;
+
+    body.querySelectorAll('button[data-act]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const idx = parseInt(btn.dataset.idx, 10);
+            const act = btn.dataset.act;
+            const arr = loadNavHistory();
+            const it = arr[idx];
+            if (!it) return;
+            if (act === 'delete') {
+                arr.splice(idx, 1);
+                try { localStorage.setItem(NAV_HISTORY_KEY, JSON.stringify(arr)); } catch (_) {}
+                renderNavHistoryDrawer();
+            } else if (act === 'reuse') {
+                if (it.origin) setRouteOrigin(L.latLng(it.origin.lat, it.origin.lng), it.origin.name);
+                if (it.dest)   setRouteDestination(L.latLng(it.dest.lat,   it.dest.lng),   it.dest.name);
+                // 切回对应模式
+                const btnEl = document.querySelector(`.route-mode-btn[data-mode="${it.transport}"]`);
+                if (btnEl) btnEl.click();
+                closeNavHistoryDrawer();
+                showToast('↩️ 已恢复历史路线起终点', 'success');
+            }
+        });
+    });
+}
+
+// 历史抽屉事件（一次性绑定）
+{
+    const closeBtn = document.getElementById('nav-history-close');
+    const clearBtn = document.getElementById('nav-history-clear');
+    if (closeBtn) closeBtn.addEventListener('click', closeNavHistoryDrawer);
+    if (clearBtn) clearBtn.addEventListener('click', () => {
+        if (!confirm('确定要清空所有导航历史记录吗？')) return;
+        clearNavHistory();
+        renderNavHistoryDrawer();
+        showToast('🗑 已清空全部记录', 'info');
+    });
+}

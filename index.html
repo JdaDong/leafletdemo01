@@ -560,6 +560,44 @@
         .route-panel .route-point .clear-btn:hover {
             color: #E53935;
         }
+        /* 📍 我的位置按钮 */
+        .route-panel .route-point .locate-btn {
+            cursor: pointer;
+            color: #aaa;
+            font-size: 13px;
+            padding: 0 3px;
+            user-select: none;
+            transition: color 0.15s;
+        }
+        .route-panel .route-point .locate-btn:hover {
+            color: #1E88E5;
+        }
+        .route-panel .route-point .locate-btn.loading {
+            opacity: 0.5;
+            cursor: wait;
+            animation: spin 1.2s linear infinite;
+        }
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to   { transform: rotate(360deg); }
+        }
+        /* 联想下拉里的"📍 我的位置"特殊项 */
+        .route-tips .route-tip-item.my-location {
+            background: #f0f7ff;
+            border-bottom: 1px solid #bbdefb;
+        }
+        .route-tips .route-tip-item.my-location:hover,
+        .route-tips .route-tip-item.my-location.highlight {
+            background: #e3f2fd;
+        }
+        .route-tips .route-tip-item.my-location .tip-icon {
+            background: #1E88E5;
+            color: #fff;
+        }
+        .route-tips .route-tip-item.my-location .tip-name {
+            color: #1565C0;
+            font-weight: 600;
+        }
         .route-panel .route-actions {
             display: flex;
             gap: 6px;
@@ -695,6 +733,251 @@
         .route-panel .transit-item .seg-sep {
             color: #bbb;
             margin: 0 2px;
+        }
+
+        /* ========== 驾车策略选择行（仅 driving 模式显示） ========== */
+        .route-panel .route-strategy {
+            display: none;
+            gap: 6px;
+            padding: 6px 12px;
+            border-bottom: 1px solid #eee;
+            background: #fafafa;
+            align-items: center;
+        }
+        .route-panel .route-strategy.active {
+            display: flex;
+        }
+        .route-panel .route-strategy label {
+            font-size: 12px;
+            color: #666;
+            flex-shrink: 0;
+        }
+        .route-panel .route-strategy select {
+            flex: 1;
+            padding: 4px 6px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            outline: none;
+            font-size: 12px;
+            background: #fff;
+            cursor: pointer;
+            min-width: 0;
+        }
+        .route-panel .route-strategy select:focus {
+            border-color: #1E88E5;
+        }
+
+        /* ========== 途经点（waypoints） ========== */
+        .route-panel .route-waypoints {
+            display: none;
+            padding: 0 12px 4px 12px;
+            border-bottom: 1px dashed #eee;
+        }
+        .route-panel .route-waypoints.active {
+            display: block;
+        }
+        .route-panel .waypoint-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 0;
+            position: relative;
+        }
+        .route-panel .waypoint-item .dot {
+            width: 18px;
+            height: 18px;
+            line-height: 18px;
+            text-align: center;
+            border-radius: 50%;
+            background: #8E24AA;
+            color: #fff;
+            font-size: 11px;
+            font-weight: bold;
+            flex-shrink: 0;
+        }
+        .route-panel .waypoint-item .text {
+            flex: 1;
+            color: #555;
+            font-size: 12px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .route-panel .waypoint-item .move-btn,
+        .route-panel .waypoint-item .clear-btn {
+            cursor: pointer;
+            color: #aaa;
+            font-size: 13px;
+            padding: 0 2px;
+            user-select: none;
+        }
+        .route-panel .waypoint-item .move-btn:hover {
+            color: #1E88E5;
+        }
+        .route-panel .waypoint-item .clear-btn:hover {
+            color: #E53935;
+        }
+        .route-panel .add-waypoint-btn {
+            display: block;
+            width: 100%;
+            margin: 6px 0 4px 0;
+            padding: 5px 0;
+            background: #fff;
+            color: #8E24AA;
+            border: 1px dashed #8E24AA;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .route-panel .add-waypoint-btn:hover {
+            background: #f5e9f7;
+        }
+        .route-panel .add-waypoint-btn:disabled {
+            color: #bbb;
+            border-color: #ddd;
+            cursor: not-allowed;
+            background: #fafafa;
+        }
+
+        /* ========== 途经点搜索框（A 方案） ========== */
+        .route-panel .waypoint-search-wrap {
+            position: relative;
+            margin: 4px 0 4px 0;
+            display: block;
+        }
+        .route-panel .waypoint-search-wrap.hidden {
+            display: none;
+        }
+        .route-panel .waypoint-search-row {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            background: #faf5fc;
+            border: 1px solid #d6b4e0;
+            border-radius: 4px;
+            padding: 2px 6px;
+        }
+        .route-panel .waypoint-search-row .search-icon {
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+        .route-panel .waypoint-search-input {
+            flex: 1;
+            min-width: 0;
+            border: none;
+            outline: none;
+            background: transparent;
+            padding: 4px 2px;
+            font-size: 12px;
+            line-height: 18px;
+            color: #333;
+        }
+        .route-panel .waypoint-search-input::placeholder {
+            color: #b89bc4;
+        }
+        .route-panel .waypoint-search-clear {
+            cursor: pointer;
+            color: #b89bc4;
+            font-size: 12px;
+            padding: 0 2px;
+            display: none;
+        }
+        .route-panel .waypoint-search-row.has-value .waypoint-search-clear {
+            display: inline;
+        }
+        .route-panel .waypoint-search-clear:hover {
+            color: #8E24AA;
+        }
+        /* 复用 .route-tips 样式，但下拉位置贴在 .waypoint-search-wrap 上 */
+
+        /* ========== 途经点 item 可点击编辑（B 方案） ========== */
+        .route-panel .waypoint-item .text.editable {
+            cursor: pointer;
+            border-bottom: 1px dashed transparent;
+        }
+        .route-panel .waypoint-item .text.editable:hover {
+            border-bottom-color: #8E24AA;
+            color: #8E24AA;
+        }
+        /* 编辑态：同行内联输入框 */
+        .route-panel .waypoint-item.editing {
+            background: #faf5fc;
+        }
+        .route-panel .waypoint-item .waypoint-edit-input {
+            flex: 1;
+            min-width: 0;
+            border: 1px solid #8E24AA;
+            border-radius: 3px;
+            outline: none;
+            padding: 2px 6px;
+            font-size: 12px;
+            background: #fff;
+        }
+        .route-panel .waypoint-item .route-tips {
+            top: 100%;
+            left: 26px;
+            right: 0;
+        }
+
+        /* ========== 多路线对比卡片 ========== */
+        .route-panel .route-alternatives {
+            display: none;
+            padding: 8px 12px;
+            border-top: 1px solid #e1efff;
+            background: #fafdff;
+        }
+        .route-panel .route-alternatives.active {
+            display: block;
+        }
+        .route-panel .route-alternatives .alt-title {
+            font-size: 11px;
+            color: #888;
+            margin-bottom: 6px;
+            font-weight: bold;
+        }
+        .route-panel .alt-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 8px;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            margin-bottom: 4px;
+            cursor: pointer;
+            background: #fff;
+            transition: all 0.15s;
+        }
+        .route-panel .alt-item:hover {
+            border-color: #1E88E5;
+            background: #f5f9ff;
+        }
+        .route-panel .alt-item.active {
+            border-color: #1E88E5;
+            background: #e3f2fd;
+            box-shadow: 0 1px 4px rgba(30,136,229,0.25);
+        }
+        .route-panel .alt-item .alt-color {
+            width: 12px; height: 12px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .route-panel .alt-item .alt-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .route-panel .alt-item .alt-name {
+            font-size: 12px;
+            font-weight: bold;
+            color: #333;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .route-panel .alt-item .alt-meta {
+            font-size: 11px;
+            color: #777;
+            margin-top: 1px;
         }
 
         /* ========== 地图右键菜单 ========== */
@@ -1195,6 +1478,343 @@
         .marker-cluster-poi-large div {
             background-color: rgba(229, 57, 53, 0.9);
         }
+
+        /* ============================================================
+         *  实时骑行导航 —— HUD / 历史记录 / 完成弹窗
+         * ============================================================ */
+        /* 顶部 HUD 卡片：导航中常驻屏幕顶部，显示 剩余距离/剩余时间/速度/转向提示 */
+        .nav-hud {
+            display: none;
+            position: fixed;
+            top: 14px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1500;
+            background: linear-gradient(135deg, #1E88E5 0%, #1565C0 100%);
+            color: #fff;
+            padding: 12px 16px;
+            border-radius: 12px;
+            box-shadow: 0 6px 22px rgba(0,0,0,0.28);
+            min-width: 320px;
+            max-width: 92vw;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            user-select: none;
+        }
+        .nav-hud.active { display: block; }
+        .nav-hud .hud-row1 {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .nav-hud .hud-turn-icon {
+            font-size: 30px;
+            line-height: 1;
+            flex-shrink: 0;
+            min-width: 36px;
+            text-align: center;
+            text-shadow: 0 2px 6px rgba(0,0,0,0.3);
+        }
+        .nav-hud .hud-turn-text {
+            flex: 1;
+            font-size: 14px;
+            font-weight: 500;
+            line-height: 1.3;
+            opacity: 0.95;
+        }
+        .nav-hud .hud-row2 {
+            display: flex;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid rgba(255,255,255,0.25);
+            gap: 12px;
+        }
+        .nav-hud .hud-stat {
+            flex: 1;
+            text-align: center;
+        }
+        .nav-hud .hud-stat .stat-num {
+            font-size: 18px;
+            font-weight: 600;
+            line-height: 1.1;
+        }
+        .nav-hud .hud-stat .stat-label {
+            font-size: 11px;
+            opacity: 0.8;
+            margin-top: 2px;
+        }
+        .nav-hud .hud-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .nav-hud .hud-btn {
+            flex: 1;
+            padding: 6px 10px;
+            font-size: 12px;
+            background: rgba(255,255,255,0.18);
+            color: #fff;
+            border: 1px solid rgba(255,255,255,0.4);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .nav-hud .hud-btn:hover { background: rgba(255,255,255,0.32); }
+        .nav-hud .hud-btn.danger {
+            background: rgba(229,57,53,0.85);
+            border-color: rgba(255,255,255,0.5);
+        }
+        .nav-hud .hud-btn.danger:hover { background: rgba(229,57,53,1); }
+        .nav-hud .hud-progress {
+            height: 4px;
+            background: rgba(255,255,255,0.25);
+            border-radius: 2px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+        .nav-hud .hud-progress-bar {
+            height: 100%;
+            background: #ffeb3b;
+            border-radius: 2px;
+            width: 0%;
+            transition: width 0.3s linear;
+        }
+        .nav-hud .hud-mode-tag {
+            display: inline-block;
+            font-size: 10px;
+            background: rgba(255,255,255,0.22);
+            padding: 2px 6px;
+            border-radius: 8px;
+            margin-left: 6px;
+            vertical-align: middle;
+        }
+
+        /* 模拟导航——速度滑块（HUD 内显示） */
+        .nav-hud .hud-sim-row {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            margin-top: 8px;
+            font-size: 11px;
+        }
+        .nav-hud .hud-sim-row.active { display: flex; }
+        .nav-hud .hud-sim-row input[type=range] {
+            flex: 1;
+            accent-color: #ffeb3b;
+        }
+
+        /* 路径规划 summary 内的"开始导航 / 模拟"按钮组 */
+        .nav-launch-row {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+            padding-top: 8px;
+            border-top: 1px dashed #e0e0e0;
+        }
+        .nav-launch-row button {
+            flex: 1;
+            padding: 6px 10px;
+            font-size: 12px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .nav-launch-row .nav-real-btn {
+            background: #1E88E5;
+            color: #fff;
+            border: 1px solid #1E88E5;
+        }
+        .nav-launch-row .nav-real-btn:hover { background: #1565C0; }
+        .nav-launch-row .nav-sim-btn {
+            background: #fff;
+            color: #FB8C00;
+            border: 1px solid #FB8C00;
+        }
+        .nav-launch-row .nav-sim-btn:hover { background: #fff3e0; }
+        .nav-launch-row .nav-history-btn {
+            background: #fff;
+            color: #555;
+            border: 1px solid #bbb;
+            flex: 0 0 auto;
+            padding: 6px 12px;
+        }
+        .nav-launch-row .nav-history-btn:hover { background: #f5f5f5; }
+
+        /* 完成弹窗（到达终点后） */
+        .nav-finish-mask {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.55);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+        }
+        .nav-finish-mask.active { display: flex; }
+        .nav-finish-card {
+            background: #fff;
+            border-radius: 14px;
+            padding: 24px 28px;
+            min-width: 320px;
+            max-width: 92vw;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+            text-align: center;
+            animation: navFinishIn 0.35s ease;
+        }
+        @keyframes navFinishIn {
+            from { transform: scale(0.85); opacity: 0; }
+            to   { transform: scale(1);    opacity: 1; }
+        }
+        .nav-finish-card .finish-emoji { font-size: 44px; }
+        .nav-finish-card .finish-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin: 6px 0 16px;
+            color: #2E7D32;
+        }
+        .nav-finish-card .finish-stats {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 18px;
+        }
+        .nav-finish-card .stat-cell {
+            background: #f5f7fa;
+            padding: 10px 6px;
+            border-radius: 8px;
+        }
+        .nav-finish-card .stat-cell .v {
+            font-size: 18px;
+            font-weight: 600;
+            color: #1E88E5;
+        }
+        .nav-finish-card .stat-cell .l {
+            font-size: 11px;
+            color: #666;
+            margin-top: 2px;
+        }
+        .nav-finish-card button {
+            padding: 8px 22px;
+            border-radius: 6px;
+            border: none;
+            background: #1E88E5;
+            color: #fff;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .nav-finish-card button:hover { background: #1565C0; }
+
+        /* 历史导航记录抽屉（右侧） */
+        .nav-history-drawer {
+            display: none;
+            position: fixed;
+            top: 0;
+            right: 0;
+            width: 340px;
+            max-width: 92vw;
+            height: 100vh;
+            background: #fff;
+            box-shadow: -4px 0 18px rgba(0,0,0,0.2);
+            z-index: 1700;
+            flex-direction: column;
+        }
+        .nav-history-drawer.active { display: flex; }
+        .nav-history-drawer .nh-header {
+            padding: 14px 16px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #fafafa;
+        }
+        .nav-history-drawer .nh-header .nh-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: #333;
+        }
+        .nav-history-drawer .nh-close {
+            font-size: 18px;
+            cursor: pointer;
+            color: #888;
+            padding: 0 6px;
+        }
+        .nav-history-drawer .nh-close:hover { color: #333; }
+        .nav-history-drawer .nh-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 12px;
+        }
+        .nav-history-drawer .nh-empty {
+            text-align: center;
+            color: #999;
+            font-size: 13px;
+            padding: 30px 0;
+        }
+        .nav-history-drawer .nh-item {
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+            font-size: 12px;
+            background: #fff;
+            transition: all 0.15s;
+        }
+        .nav-history-drawer .nh-item:hover {
+            border-color: #1E88E5;
+            box-shadow: 0 2px 8px rgba(30,136,229,0.15);
+        }
+        .nav-history-drawer .nh-item .nh-it-title {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 4px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .nav-history-drawer .nh-item .nh-it-mode {
+            font-size: 10px;
+            background: #e3f2fd;
+            color: #1565C0;
+            padding: 1px 6px;
+            border-radius: 8px;
+        }
+        .nav-history-drawer .nh-item .nh-it-line {
+            color: #666;
+            font-size: 11px;
+            line-height: 1.5;
+        }
+        .nav-history-drawer .nh-item .nh-it-actions {
+            margin-top: 6px;
+            display: flex;
+            gap: 6px;
+        }
+        .nav-history-drawer .nh-item .nh-it-actions button {
+            font-size: 11px;
+            padding: 3px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            border: 1px solid #ccc;
+            background: #fff;
+        }
+        .nav-history-drawer .nh-item .nh-it-actions button.danger {
+            color: #E53935;
+            border-color: #ef9a9a;
+        }
+        .nav-history-drawer .nh-it-actions button:hover { background: #f5f5f5; }
+        .nav-history-drawer .nh-footer {
+            padding: 10px 16px;
+            border-top: 1px solid #eee;
+            text-align: right;
+        }
+        .nav-history-drawer .nh-clear-btn {
+            font-size: 11px;
+            padding: 4px 10px;
+            border: 1px solid #E53935;
+            color: #E53935;
+            background: #fff;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .nav-history-drawer .nh-clear-btn:hover { background: #ffebee; }
     </style>
 </head>
 <body>
@@ -1218,6 +1838,19 @@
                 <input type="text" id="route-city" placeholder="起点城市，如 北京" />
                 <input type="text" id="route-cityd" placeholder="终点城市（跨城填）" />
             </div>
+            <div class="route-strategy" id="route-strategy">
+                <label>策略</label>
+                <select id="route-strategy-select" title="驾车路线偏好">
+                    <option value="0">⚡ 速度优先（默认）</option>
+                    <option value="1">💰 费用优先（不走收费）</option>
+                    <option value="2">📏 距离优先</option>
+                    <option value="4">🚧 躲避拥堵</option>
+                    <option value="5">🆚 多策略对比（返 3 条）</option>
+                    <option value="6">🛣️ 不走高速</option>
+                    <option value="7">🚯 不走高速且避免收费</option>
+                    <option value="8">🚦 躲避收费和拥堵</option>
+                </select>
+            </div>
             <div class="route-points">
                 <div class="route-point origin">
                     <span class="dot"></span>
@@ -1226,7 +1859,19 @@
                         <input type="text" class="route-point-input" id="route-origin-input" placeholder="输入起点地名 / POI" autocomplete="off" />
                         <div class="route-tips" id="route-origin-tips"></div>
                     </div>
+                    <span class="locate-btn" id="route-origin-locate" title="使用我的当前位置">📍</span>
                     <span class="clear-btn" id="route-origin-clear" title="清除起点">✕</span>
+                </div>
+                <div class="route-waypoints" id="route-waypoints"></div>
+                <!-- A: 通过搜索 POI 添加途经点（输入框 + 联想） -->
+                <div class="waypoint-search-wrap" id="waypoint-search-wrap">
+                    <div class="waypoint-search-row">
+                        <span class="search-icon">🟣</span>
+                        <input type="text" class="waypoint-search-input" id="waypoint-search-input"
+                               placeholder="搜索地点添加为途经点 / 回车确认 / Esc 关闭" autocomplete="off" />
+                        <span class="waypoint-search-clear" id="waypoint-search-clear" title="清空输入">✕</span>
+                    </div>
+                    <div class="route-tips" id="waypoint-search-tips"></div>
                 </div>
                 <div class="route-point destination">
                     <span class="dot"></span>
@@ -1235,16 +1880,19 @@
                         <input type="text" class="route-point-input" id="route-destination-input" placeholder="输入终点地名 / POI" autocomplete="off" />
                         <div class="route-tips" id="route-destination-tips"></div>
                     </div>
+                    <span class="locate-btn" id="route-destination-locate" title="使用我的当前位置">📍</span>
                     <span class="clear-btn" id="route-destination-clear" title="清除终点">✕</span>
                 </div>
+                <button class="add-waypoint-btn" id="add-waypoint-btn" title="添加途经点（最多 16 个）">➕ 通过右键地图添加途经点</button>
             </div>
             <div class="route-actions">
                 <button class="plan-btn" id="route-plan-btn">开始规划</button>
                 <button class="clear-all-btn" id="route-clear-btn">清除路径</button>
             </div>
             <div class="route-summary" id="route-summary"></div>
+            <div class="route-alternatives" id="route-alternatives"></div>
             <div class="route-transits" id="route-transits"></div>
-            <div class="route-tip">提示：右键地图 → 选择"从这里出发"或"到这里去"</div>
+            <div class="route-tip">提示：右键地图 → 起点/终点/途经点；驾车支持多策略对比</div>
         </div>
     </div>
 
@@ -1266,6 +1914,7 @@
         <div class="menu-divider"></div>
         <div class="menu-item" data-action="set-origin">🟢 从这里出发</div>
         <div class="menu-item" data-action="set-destination">🔴 到这里去</div>
+        <div class="menu-item" data-action="set-waypoint">🟣 设为途经点</div>
         <div class="menu-divider"></div>
         <div class="menu-item" data-action="copy-coord">📋 复制坐标</div>
         <div class="menu-item" data-action="center-here">🎯 以此为中心</div>
@@ -1286,6 +1935,7 @@
         <div class="drawer-actions">
             <button id="drawer-locate">🎯 定位</button>
             <button id="drawer-as-origin">🟢 设为起点</button>
+            <button id="drawer-as-waypoint">🟣 途经点</button>
             <button id="drawer-as-dest" class="primary">🔴 到这里去</button>
         </div>
     </div>
@@ -1370,6 +2020,79 @@
         <div class="legend-item"><span class="bar" style="background:#F1C40F;"></span>缓行</div>
         <div class="legend-item"><span class="bar" style="background:#E67E22;"></span>拥堵</div>
         <div class="legend-item"><span class="bar" style="background:#C0392B;"></span>严重拥堵</div>
+    </div>
+
+    <!--
+        ==========================================================
+          实时骑行导航 — DOM
+            1) 顶部 HUD：导航中常驻
+            2) 完成弹窗：到达终点后弹出统计
+            3) 历史记录抽屉：保存最近 N 条导航记录
+        ========================================================== -->
+
+    <!-- HUD（顶部固定） -->
+    <div id="nav-hud" class="nav-hud">
+        <div class="hud-row1">
+            <div class="hud-turn-icon" id="nav-hud-turn-icon">⬆️</div>
+            <div class="hud-turn-text" id="nav-hud-turn-text">沿当前道路直行</div>
+        </div>
+        <div class="hud-row2">
+            <div class="hud-stat">
+                <div class="stat-num" id="nav-hud-remain-dist">--</div>
+                <div class="stat-label">剩余距离</div>
+            </div>
+            <div class="hud-stat">
+                <div class="stat-num" id="nav-hud-remain-time">--</div>
+                <div class="stat-label">剩余时间</div>
+            </div>
+            <div class="hud-stat">
+                <div class="stat-num" id="nav-hud-speed">--</div>
+                <div class="stat-label">当前速度</div>
+            </div>
+        </div>
+        <div class="hud-progress">
+            <div class="hud-progress-bar" id="nav-hud-progress-bar"></div>
+        </div>
+        <!-- 模拟模式专属：速度滑块 -->
+        <div class="hud-sim-row" id="nav-hud-sim-row">
+            <span>🎮 模拟速度</span>
+            <input type="range" id="nav-hud-sim-speed" min="3" max="60" step="1" value="15" />
+            <span id="nav-hud-sim-speed-text">15 km/h</span>
+        </div>
+        <div class="hud-actions">
+            <button class="hud-btn" id="nav-hud-recenter">📷 跟随</button>
+            <button class="hud-btn" id="nav-hud-pause">⏸ 暂停</button>
+            <button class="hud-btn danger" id="nav-hud-stop">⏹ 结束</button>
+        </div>
+    </div>
+
+    <!-- 完成弹窗 -->
+    <div id="nav-finish-mask" class="nav-finish-mask">
+        <div class="nav-finish-card">
+            <div class="finish-emoji">🎉</div>
+            <div class="finish-title" id="nav-finish-title">已到达终点！</div>
+            <div class="finish-stats">
+                <div class="stat-cell"><div class="v" id="nav-finish-dist">-</div><div class="l">总距离</div></div>
+                <div class="stat-cell"><div class="v" id="nav-finish-time">-</div><div class="l">总用时</div></div>
+                <div class="stat-cell"><div class="v" id="nav-finish-avg">-</div><div class="l">平均速度</div></div>
+                <div class="stat-cell"><div class="v" id="nav-finish-max">-</div><div class="l">最高速度</div></div>
+            </div>
+            <button id="nav-finish-ok">好的</button>
+        </div>
+    </div>
+
+    <!-- 历史记录抽屉 -->
+    <div id="nav-history-drawer" class="nav-history-drawer">
+        <div class="nh-header">
+            <div class="nh-title">📜 导航历史记录</div>
+            <div class="nh-close" id="nav-history-close" title="关闭">✕</div>
+        </div>
+        <div class="nh-body" id="nav-history-list">
+            <div class="nh-empty">暂无导航记录</div>
+        </div>
+        <div class="nh-footer">
+            <button class="nh-clear-btn" id="nav-history-clear">🗑 清空全部</button>
+        </div>
     </div>
 
     <!--
