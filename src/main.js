@@ -60,6 +60,8 @@ import {
     AMAP_TILE_URLS,
 } from './config.js';
 import { wgs84ToGcj02, CoordTransform } from './utils/coord.js';
+// deck.gl 3D 立柱图模块（基于 WebGL 的真 3D，叠加在 Leaflet 之上）
+import { initDeckGL3D } from './deckgl3d.js';
 import { escapeHtml } from './utils/dom.js';
 import {
     loadHistory, addSearchHistory, clearHistory,
@@ -134,6 +136,11 @@ setInterval(() => {
 
 // 5. 默认加载矢量地图
 gaodeNormal.addTo(map);
+
+// 5.1 暴露地图实例（供文件末尾的扩展模块使用，例如 3D 立体感模块）
+window.__leafletMap = map;
+window.__AMAP_WEB_KEY = AMAP_WEB_KEY;
+window.__coordTransform = { wgs84ToGcj02, CoordTransform };
 
 // 6. 图层控制（右上角切换按钮）
 // 6.0 POI 热力图层（leaflet.heat）——数据源为当前 POI 搜索结果
@@ -420,6 +427,11 @@ L.control.scale({ imperial: false, position: 'bottomleft' }).addTo(map);
 map.on('click', (e) => {
     // 测量模式下交给测量工具处理，避免弹出调试 popup 遮挡
     if (typeof measureMode !== 'undefined' && measureMode && measureMode !== 'idle') return;
+    // 「点击地名详情」模块开启时，由它来弹卡片，本调试 popup 让位（避免互相抢占）
+    if (window.__clickPlace && window.__clickPlace.state && window.__clickPlace.state.enabled) {
+        console.log('点击位置 (GCJ-02):', e.latlng);
+        return;
+    }
     console.log('点击位置 (GCJ-02):', e.latlng);
     L.popup()
         .setLatLng(e.latlng)
@@ -8633,3 +8645,920 @@ ${trkpts}
     console.log('%c[NavFx] 超级导航增强已加载 ✨',
         'color:#ad1457;font-weight:bold;background:#fce4ec;padding:2px 6px;border-radius:3px');
 })();
+
+
+// ============================================================================
+// 🏙 方向一：3D / 立体感模块（自包含 IIFE，不影响其他模块）
+// 包含 3 项功能：
+//   3D-2 地形高度图     —— 多色阶等值带 + 阴影模拟起伏
+//   3D-3 倾斜 45° 视角  —— CSS perspective + rotateX
+//   3D-4 楼宇灯光夜景   —— 整图夜晚色调滤镜
+//
+// 注：原 3D-1 矢量建筑挤出（OSM Canvas 伪 3D）已被 deck.gl 真 3D 取代，
+//     请使用右上角 🏗 按钮 → 勾选 "OSM 真 3D 建筑"。
+// ============================================================================
+(function init3DPack() {
+    const map = window.__leafletMap;
+    if (!map || !window.L) {
+        console.warn('[3DPack] 找不到 leaflet map 实例，3D 模块跳过加载');
+        return;
+    }
+    const L = window.L;
+
+    // -------------------- 模块状态 --------------------
+    const state = {
+        // 3D-2 地形
+        terrain: {
+            enabled: false,
+            layer: null,
+        },
+        // 3D-3 倾斜
+        tilt: {
+            enabled: false,
+            angle: 50, // deg
+        },
+        // 3D-4 夜景灯光
+        nightLights: {
+            enabled: false,
+        },
+    };
+
+    // -------------------- 注入样式 --------------------
+    const style = document.createElement('style');
+    style.textContent = `
+.three-d-toggle {
+    background: #fff; width: 36px; height: 36px; border-radius: 4px;
+    box-shadow: 0 1px 5px rgba(0,0,0,0.4); cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; user-select: none;
+}
+.three-d-toggle:hover { background: #f4f4f4; }
+.three-d-panel {
+    position: absolute; right: 50px; top: 0; width: 240px;
+    background: rgba(255,255,255,0.97); border-radius: 6px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.25); padding: 10px 12px;
+    font-size: 12px; color: #333; display: none;
+}
+.three-d-panel.active { display: block; }
+.three-d-panel h4 {
+    margin: 0 0 8px 0; font-size: 13px; color: #1976d2;
+    border-bottom: 1px solid #e0e0e0; padding-bottom: 4px;
+    display: flex; align-items: center; justify-content: space-between;
+}
+.three-d-panel .td-close-btn {
+    width: 20px; height: 20px; line-height: 18px; text-align: center;
+    border-radius: 50%; cursor: pointer; color: #999;
+    font-size: 16px; user-select: none; font-weight: normal;
+    transition: all 0.15s;
+}
+.three-d-panel .td-close-btn:hover { background: #e3f2fd; color: #1976d2; }
+.three-d-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 4px 0; gap: 6px;
+}
+.three-d-row label { flex: 1; cursor: pointer; }
+.three-d-row input[type=range] { flex: 1; }
+.three-d-row .hint { color: #888; font-size: 11px; margin-top: 2px; }
+.three-d-btn {
+    background: #1976d2; color: #fff; border: 0; border-radius: 3px;
+    padding: 4px 10px; cursor: pointer; font-size: 12px;
+}
+.three-d-btn:hover { background: #1565c0; }
+.three-d-btn.danger { background: #d32f2f; }
+.three-d-status {
+    font-size: 11px; color: #666; padding: 4px 0;
+}
+/* 3D-3 倾斜：作用在 leaflet map pane 上 */
+.leaflet-pane.tilt-3d {
+    transition: transform 0.45s ease;
+    transform-origin: center 60%;
+}
+/* 3D-4 夜景：地图整体加暗 + 蓝色调 */
+.leaflet-container.night-lights .leaflet-tile-pane {
+    filter: brightness(0.45) contrast(1.05) hue-rotate(-15deg) saturate(1.3);
+}
+`;
+    document.head.appendChild(style);
+
+    // -------------------- Leaflet 控件：右侧 🏙 按钮 + 面板 --------------------
+    const ThreeDControl = L.Control.extend({
+        options: { position: 'topright' },
+        onAdd() {
+            const wrap = L.DomUtil.create('div', 'leaflet-bar three-d-control');
+            wrap.style.position = 'relative';
+
+            const btn = L.DomUtil.create('a', 'three-d-toggle', wrap);
+            btn.href = '#';
+            btn.title = '3D 立体感';
+            btn.innerHTML = '🏙';
+
+            const panel = L.DomUtil.create('div', 'three-d-panel', wrap);
+            panel.innerHTML = `
+                <h4>
+                    <span>🏙 3D / 立体感</span>
+                    <span class="td-close-btn" title="收起面板">×</span>
+                </h4>
+
+                <div class="three-d-status" style="color:#888;font-size:11px;padding:2px 0 6px 0;">
+                    💡 矢量建筑挤出已升级为 deck.gl 真 3D，请点击右上角 🏗 按钮使用
+                </div>
+
+                <div class="three-d-row">
+                    <label><input type="checkbox" id="td-terrain"> 地形等值带</label>
+                </div>
+                <div class="three-d-status">基于经纬度生成柔和起伏色阶</div>
+
+                <div class="three-d-row" style="border-top:1px dashed #e0e0e0;margin-top:6px;padding-top:8px;">
+                    <label><input type="checkbox" id="td-tilt"> 倾斜 45° 视角</label>
+                </div>
+                <div class="three-d-row">
+                    <span style="font-size:11px;">倾斜角度</span>
+                    <input type="range" id="td-tilt-angle" min="20" max="65" step="1" value="50" style="width:120px;">
+                    <span id="td-tilt-val" style="width:30px;text-align:right;">50°</span>
+                </div>
+
+                <div class="three-d-row" style="border-top:1px dashed #e0e0e0;margin-top:6px;padding-top:8px;">
+                    <label><input type="checkbox" id="td-night"> 夜景灯光</label>
+                </div>
+                <div class="three-d-status">夜晚色调滤镜（地图整体变暗 + 蓝色调）</div>
+
+                <div class="three-d-row" style="border-top:1px solid #e0e0e0;margin-top:8px;padding-top:6px;">
+                    <button class="three-d-btn" id="td-preset-city">🏙 城市套餐</button>
+                    <button class="three-d-btn danger" id="td-reset">重置</button>
+                </div>
+            `;
+
+            // 阻止事件冒泡到地图
+            L.DomEvent.disableClickPropagation(wrap);
+            L.DomEvent.disableScrollPropagation(wrap);
+
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                panel.classList.toggle('active');
+            });
+
+            // 面板内的关闭按钮：只收起面板，不影响 3D 效果开关状态
+            const closeBtn = panel.querySelector('.td-close-btn');
+            if (closeBtn) {
+                closeBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    panel.classList.remove('active');
+                });
+            }
+
+            // 绑定交互
+            setTimeout(() => bindControls(panel), 0);
+
+            return wrap;
+        }
+    });
+
+    // -------------------- 工具函数 --------------------
+    function getBBoxStr() {
+        const b = map.getBounds();
+        return `${b.getSouth().toFixed(5)},${b.getWest().toFixed(5)},${b.getNorth().toFixed(5)},${b.getEast().toFixed(5)}`;
+    }
+
+    // 3D-2：地形等值带（GeoJSON 等值带 demo）
+    function enableTerrain() {
+        if (state.terrain.layer) return;
+        // 在当前视野生成 5×5 网格的"高度色块"模拟等值带
+        const b = map.getBounds();
+        const lat0 = b.getSouth(), lat1 = b.getNorth();
+        const lon0 = b.getWest(),  lon1 = b.getEast();
+        const N = 12;
+        const dLat = (lat1 - lat0) / N;
+        const dLon = (lon1 - lon0) / N;
+        const layers = [];
+        const palette = ['#5b8c51', '#7daf6f', '#a4cd84', '#c8d97a', '#e7d56b',
+                         '#dca552', '#b67844', '#8b5a3c', '#a18573', '#dcdcdc'];
+        // 用一个伪噪声函数
+        const noise = (x, y) => {
+            return (
+                Math.sin(x * 1.3 + y * 0.7) * 0.5 +
+                Math.sin(x * 2.7 - y * 1.5) * 0.3 +
+                Math.cos(x * 0.4 + y * 2.1) * 0.2
+            ) * 0.5 + 0.5;
+        };
+        for (let i = 0; i < N; i++) {
+            for (let j = 0; j < N; j++) {
+                const v = noise(i, j);
+                const ci = Math.min(palette.length - 1, Math.floor(v * palette.length));
+                const sw = [lat0 + i * dLat, lon0 + j * dLon];
+                const ne = [lat0 + (i + 1) * dLat, lon0 + (j + 1) * dLon];
+                const rect = L.rectangle([sw, ne], {
+                    color: palette[ci],
+                    weight: 0,
+                    fillColor: palette[ci],
+                    fillOpacity: 0.45,
+                    interactive: false,
+                });
+                layers.push(rect);
+            }
+        }
+        state.terrain.layer = L.layerGroup(layers).addTo(map);
+    }
+    function disableTerrain() {
+        if (state.terrain.layer) {
+            map.removeLayer(state.terrain.layer);
+            state.terrain.layer = null;
+        }
+    }
+
+    // 3D-3：倾斜视角
+    function applyTilt() {
+        const mapEl = map.getContainer();
+        const panes = mapEl.querySelectorAll('.leaflet-map-pane');
+        panes.forEach(p => {
+            if (state.tilt.enabled) {
+                p.style.transition = 'transform 0.45s ease';
+                p.style.transformStyle = 'preserve-3d';
+                // 在原 leaflet transform 之外再叠加 perspective
+                p.style.perspective = '1200px';
+                p.style.transform = `${getBaseTransform(p)} perspective(1200px) rotateX(${state.tilt.angle}deg)`;
+                p.classList.add('tilt-3d');
+            } else {
+                p.style.perspective = '';
+                p.style.transform = getBaseTransform(p);
+                p.classList.remove('tilt-3d');
+            }
+        });
+    }
+
+    // 由于 Leaflet 自己会反复重置 transform，我们改为 wrapper 元素来加倾斜
+    function applyTiltViaWrapper() {
+        const mapEl = map.getContainer();
+        if (state.tilt.enabled) {
+            mapEl.style.perspective = '1500px';
+            mapEl.style.perspectiveOrigin = 'center 60%';
+            const tilePane = mapEl.querySelector('.leaflet-tile-pane');
+            const overlayPane = mapEl.querySelector('.leaflet-overlay-pane');
+            const markerPane = mapEl.querySelector('.leaflet-marker-pane');
+            [tilePane, overlayPane, markerPane].forEach(p => {
+                if (!p) return;
+                p.style.transformOrigin = 'center 60%';
+                p.style.transition = 'transform 0.45s ease';
+            });
+            // 用 CSS var + class 控制
+            mapEl.style.setProperty('--tilt-angle', state.tilt.angle + 'deg');
+            mapEl.classList.add('three-d-tilt-on');
+            ensureTiltStyle();
+        } else {
+            mapEl.classList.remove('three-d-tilt-on');
+            mapEl.style.perspective = '';
+        }
+    }
+
+    function ensureTiltStyle() {
+        if (document.getElementById('three-d-tilt-style')) return;
+        const s = document.createElement('style');
+        s.id = 'three-d-tilt-style';
+        s.textContent = `
+.three-d-tilt-on .leaflet-tile-pane,
+.three-d-tilt-on .leaflet-overlay-pane,
+.three-d-tilt-on .leaflet-marker-pane,
+.three-d-tilt-on .leaflet-shadow-pane,
+.three-d-tilt-on .leaflet-popup-pane {
+    transform: rotateX(var(--tilt-angle, 50deg));
+    transform-origin: center 65%;
+    transition: transform 0.45s ease;
+}
+`;
+        document.head.appendChild(s);
+    }
+
+    function getBaseTransform(el) {
+        const m = el.style.transform || '';
+        // 移除既有的 perspective / rotateX
+        return m.replace(/perspective\([^)]+\)/g, '').replace(/rotateX\([^)]+\)/g, '').trim();
+    }
+
+    // 3D-4：夜景灯光
+    function applyNight() {
+        const mapEl = map.getContainer();
+        if (state.nightLights.enabled) {
+            mapEl.classList.add('night-lights');
+        } else {
+            mapEl.classList.remove('night-lights');
+        }
+    }
+
+    // -------------------- 绑定 UI --------------------
+    function bindControls(panel) {
+        const $ = id => panel.querySelector('#' + id);
+
+        const cbTerrain = $('td-terrain');
+        const cbTilt = $('td-tilt');
+        const rangeTilt = $('td-tilt-angle');
+        const tiltVal = $('td-tilt-val');
+        const cbNight = $('td-night');
+
+        cbTerrain.addEventListener('change', () => {
+            state.terrain.enabled = cbTerrain.checked;
+            if (state.terrain.enabled) enableTerrain();
+            else disableTerrain();
+        });
+
+        cbTilt.addEventListener('change', () => {
+            state.tilt.enabled = cbTilt.checked;
+            applyTiltViaWrapper();
+        });
+        rangeTilt.addEventListener('input', () => {
+            state.tilt.angle = parseInt(rangeTilt.value, 10);
+            tiltVal.textContent = state.tilt.angle + '°';
+            if (state.tilt.enabled) {
+                map.getContainer().style.setProperty('--tilt-angle', state.tilt.angle + 'deg');
+            }
+        });
+
+        cbNight.addEventListener('change', () => {
+            state.nightLights.enabled = cbNight.checked;
+            applyNight();
+        });
+
+        // 一键城市套餐
+        const presetBtn = $('td-preset-city');
+        presetBtn.addEventListener('click', () => {
+            cbTilt.checked  = true; cbTilt.dispatchEvent(new Event('change'));
+            cbNight.checked = true; cbNight.dispatchEvent(new Event('change'));
+        });
+
+        // 重置
+        const resetBtn = $('td-reset');
+        resetBtn.addEventListener('click', () => {
+            [cbTerrain, cbTilt, cbNight].forEach(cb => {
+                if (cb.checked) { cb.checked = false; cb.dispatchEvent(new Event('change')); }
+            });
+        });
+    }
+
+    // 添加控件
+    new ThreeDControl().addTo(map);
+
+    // 暴露调试入口
+    window.__map3D = {
+        state,
+        enableTerrain, disableTerrain,
+        applyTiltViaWrapper, applyNight,
+    };
+
+    console.log('%c[3DPack] 🏙 3D 立体感模块已加载（地形 / 倾斜 / 夜景；建筑挤出请用 🏗 deck.gl）',
+        'color:#fff;background:#1976d2;padding:2px 6px;border-radius:3px;font-weight:bold');
+})();
+
+
+// ============================================================================
+// 📍 点击地图获取地名详情（自包含 IIFE）
+//   功能：
+//     1. 单击地图任意位置 -> 弹出详情卡片
+//     2. 高德 regeo 逆地理：省/市/区/街道/门牌号 + 行政区编码
+//     3. 高德 around 搜索：半径 50m 内最近 5 个 POI
+//     4. 显示 WGS-84 + GCJ-02 双坐标，支持一键复制
+//     5. 提供"作为终点导航"按钮（若全局存在 setNavDestination/setRouteDest 等接口）
+//     6. 顶部添加"开关"按钮，避免和绘制 / 测距等模式冲突
+// ============================================================================
+(function initClickPlaceInfo() {
+    const map = window.__leafletMap;
+    if (!map || !window.L) {
+        console.warn('[ClickPlace] 找不到 leaflet map 实例，跳过加载');
+        return;
+    }
+    const L = window.L;
+    const AMAP_KEY = window.__AMAP_WEB_KEY || '';
+    const { CoordTransform } = window.__coordTransform || {};
+
+    // -------------------- 状态 --------------------
+    const state = {
+        enabled: true,           // 默认开启
+        currentPopup: null,
+        currentMarker: null,
+        currentReqId: 0,         // 防止异步竞态：旧请求覆盖新请求
+    };
+
+    // -------------------- 注入样式 --------------------
+    const style = document.createElement('style');
+    style.textContent = `
+.click-place-toggle {
+    background: #fff; width: 36px; height: 36px; border-radius: 4px;
+    box-shadow: 0 1px 5px rgba(0,0,0,0.4); cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; user-select: none; position: relative;
+}
+.click-place-toggle.active { background: #e3f2fd; color: #1976d2; }
+.click-place-toggle:hover { background: #f4f4f4; }
+.click-place-toggle.active:hover { background: #bbdefb; }
+.click-place-toggle .badge {
+    position: absolute; top: -4px; right: -4px;
+    background: #43a047; color: #fff; font-size: 10px;
+    width: 14px; height: 14px; line-height: 14px; text-align: center;
+    border-radius: 50%; display: none;
+}
+.click-place-toggle.active .badge { display: block; }
+
+.cp-popup .leaflet-popup-content-wrapper {
+    border-radius: 8px;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.18);
+    padding: 0;
+}
+.cp-popup .leaflet-popup-content {
+    margin: 0; width: 280px !important; font-size: 13px; color: #333;
+}
+.cp-card { padding: 10px 12px; }
+.cp-card .cp-title {
+    font-weight: 600; font-size: 14px; color: #1976d2;
+    border-bottom: 1px solid #e0e0e0; padding-bottom: 6px; margin-bottom: 6px;
+    display: flex; align-items: center; gap: 4px;
+}
+.cp-card .cp-row {
+    padding: 3px 0; line-height: 1.5; word-break: break-all;
+}
+.cp-card .cp-row .lbl {
+    display: inline-block; color: #888; min-width: 56px;
+}
+.cp-card .cp-pois {
+    border-top: 1px dashed #e0e0e0; margin-top: 6px; padding-top: 6px;
+}
+.cp-card .cp-pois h5 {
+    margin: 0 0 4px 0; font-size: 12px; color: #555;
+}
+.cp-card .cp-pois ul { margin: 0; padding: 0; list-style: none; }
+.cp-card .cp-pois li {
+    padding: 3px 0; font-size: 12px;
+    display: flex; justify-content: space-between; gap: 6px;
+}
+.cp-card .cp-pois li .nm { flex: 1; color: #333; }
+.cp-card .cp-pois li .ds { color: #999; font-size: 11px; }
+.cp-card .cp-pois li .tp { color: #888; font-size: 11px; }
+.cp-card .cp-poi-detail {
+    border-top: 1px dashed #e0e0e0; margin-top: 6px; padding-top: 8px;
+}
+.cp-card .cp-poi-detail .pd-head {
+    display: flex; justify-content: space-between; align-items: flex-start; gap: 6px;
+}
+.cp-card .cp-poi-detail .pd-name {
+    font-weight: 600; font-size: 13px; color: #1976d2; line-height: 1.4;
+    flex: 1; word-break: break-all;
+}
+.cp-card .cp-poi-detail .pd-dist {
+    font-size: 11px; color: #43a047; background: #e8f5e9;
+    padding: 1px 6px; border-radius: 8px; flex: none; line-height: 1.6;
+}
+.cp-card .cp-poi-detail .pd-tag {
+    display: inline-block; font-size: 11px; color: #666; background: #f5f5f5;
+    padding: 1px 6px; border-radius: 3px; margin-top: 2px;
+}
+.cp-card .cp-poi-detail .pd-row {
+    padding: 2px 0; line-height: 1.5; font-size: 12px; color: #555;
+    word-break: break-all;
+}
+.cp-card .cp-poi-detail .pd-row .ic { width: 14px; display: inline-block; }
+.cp-card .cp-poi-detail .pd-meta {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px;
+    font-size: 12px;
+}
+.cp-card .cp-poi-detail .pd-meta .mi { color: #555; }
+.cp-card .cp-poi-detail .pd-meta .mi b { color: #f57c00; font-weight: 600; }
+.cp-card .cp-poi-detail .pd-photos {
+    display: flex; gap: 4px; margin-top: 6px; overflow-x: auto;
+}
+.cp-card .cp-poi-detail .pd-photos img {
+    width: 60px; height: 45px; object-fit: cover; border-radius: 3px;
+    flex: none; cursor: zoom-in;
+}
+.cp-card .cp-others {
+    border-top: 1px dashed #e0e0e0; margin-top: 6px; padding-top: 6px;
+}
+.cp-card .cp-others h5 {
+    margin: 0 0 4px 0; font-size: 11px; color: #888; font-weight: normal;
+}
+.cp-card .cp-others ul { margin: 0; padding: 0; list-style: none; }
+.cp-card .cp-others li {
+    padding: 2px 0; font-size: 11px; color: #777;
+    display: flex; justify-content: space-between; gap: 6px;
+}
+.cp-card .cp-others li .nm { flex: 1; }
+.cp-card .cp-others li .ds { color: #999; }
+.cp-card .cp-actions {
+    display: flex; gap: 6px; margin-top: 8px;
+    border-top: 1px solid #e0e0e0; padding-top: 8px;
+}
+.cp-card .cp-actions button {
+    flex: 1; background: #1976d2; color: #fff; border: 0;
+    border-radius: 3px; padding: 5px 0; cursor: pointer; font-size: 12px;
+}
+.cp-card .cp-actions button.sec { background: #f5f5f5; color: #333; }
+.cp-card .cp-actions button:hover { opacity: 0.85; }
+.cp-card .cp-loading {
+    color: #999; padding: 4px 0; font-size: 12px;
+}
+.cp-card .cp-warn {
+    color: #b71c1c; background: #ffebee; padding: 4px 6px;
+    border-radius: 3px; font-size: 12px; margin-top: 4px;
+}
+`;
+    document.head.appendChild(style);
+
+    // -------------------- 工具函数 --------------------
+    function fmtNum(n, dec = 6) {
+        return Number(n).toFixed(dec);
+    }
+    function fmtDist(m) {
+        if (m == null || isNaN(m)) return '-';
+        m = Number(m);
+        return m < 1000 ? m + ' m' : (m / 1000).toFixed(2) + ' km';
+    }
+    function escapeHtml(s) {
+        if (s == null) return '';
+        return String(s).replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        })[c]);
+    }
+    async function copyToClipboard(text) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch (_) {
+            try {
+                const ta = document.createElement('textarea');
+                ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+                document.body.appendChild(ta); ta.select();
+                document.execCommand('copy'); document.body.removeChild(ta);
+                return true;
+            } catch (_) { return false; }
+        }
+    }
+
+    // 高德逆地理
+    async function regeoLookup(gcjLng, gcjLat) {
+        if (!AMAP_KEY) return null;
+        const url = `https://restapi.amap.com/v3/geocode/regeo?key=${encodeURIComponent(AMAP_KEY)}&location=${gcjLng},${gcjLat}&radius=80&extensions=base&roadlevel=0`;
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('regeo HTTP ' + resp.status);
+        const json = await resp.json();
+        if (json.status !== '1') throw new Error('regeo: ' + (json.info || 'unknown'));
+        return json.regeocode || null;
+    }
+
+    // 高德周边搜索
+    async function aroundLookup(gcjLng, gcjLat, radius = 50) {
+        if (!AMAP_KEY) return [];
+        const url = `https://restapi.amap.com/v3/place/around?key=${encodeURIComponent(AMAP_KEY)}&location=${gcjLng},${gcjLat}&radius=${radius}&offset=5&page=1&extensions=base&sortrule=distance`;
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('around HTTP ' + resp.status);
+        const json = await resp.json();
+        if (json.status !== '1') return [];
+        return json.pois || [];
+    }
+
+    // 高德 POI 详情（拿到 id 后用 extensions=all 取富字段：电话、营业时间、评分、图片等）
+    async function poiDetailLookup(poiId) {
+        if (!AMAP_KEY || !poiId) return null;
+        const url = `https://restapi.amap.com/v3/place/detail?key=${encodeURIComponent(AMAP_KEY)}&id=${encodeURIComponent(poiId)}&extensions=all&output=JSON`;
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('detail HTTP ' + resp.status);
+        const json = await resp.json();
+        if (json.status !== '1') return null;
+        const arr = json.pois || [];
+        return arr[0] || null;
+    }
+
+    // 渲染卡片初始（loading 态）
+    function renderCardLoading(wgsLat, wgsLng, gcjLat, gcjLng) {
+        return `
+            <div class="cp-card" data-cp-card>
+                <div class="cp-title">📍 地点详情</div>
+                <div class="cp-row"><span class="lbl">坐标 WGS:</span> ${fmtNum(wgsLng)}, ${fmtNum(wgsLat)}</div>
+                <div class="cp-row"><span class="lbl">坐标 GCJ:</span> ${fmtNum(gcjLng)}, ${fmtNum(gcjLat)}</div>
+                <div class="cp-loading" data-cp-info>🔄 正在解析地址...</div>
+                <div class="cp-actions">
+                    <button class="sec" data-cp-act="copy">📋 复制坐标</button>
+                    <button data-cp-act="nav">🚗 设为终点</button>
+                </div>
+            </div>
+        `;
+    }
+
+    // 渲染卡片完整态（已含数据），用于 popup.setContent 一次性替换
+    function renderCardFull(wgsLat, wgsLng, gcjLat, gcjLng, regeo, pois, nearestDetail) {
+        return `
+            <div class="cp-card" data-cp-card>
+                <div class="cp-title">📍 地点详情</div>
+                <div class="cp-row"><span class="lbl">坐标 WGS:</span> ${fmtNum(wgsLng)}, ${fmtNum(wgsLat)}</div>
+                <div class="cp-row"><span class="lbl">坐标 GCJ:</span> ${fmtNum(gcjLng)}, ${fmtNum(gcjLat)}</div>
+                <div data-cp-info>${renderInfoBody(regeo, pois, nearestDetail)}</div>
+                <div class="cp-actions">
+                    <button class="sec" data-cp-act="copy">📋 复制坐标</button>
+                    <button data-cp-act="nav">🚗 设为终点</button>
+                </div>
+            </div>
+        `;
+    }
+
+    // 安全取值
+    function pick(obj, ...keys) {
+        for (const k of keys) {
+            if (obj == null) return '';
+            const v = obj[k];
+            if (v == null || v === '' || (Array.isArray(v) && v.length === 0)) {
+                obj = v;
+                continue;
+            }
+            return v;
+        }
+        // 高德有时会把空字段返回成 [] 数组，统一过滤
+        if (Array.isArray(obj) && obj.length === 0) return '';
+        return obj == null ? '' : obj;
+    }
+
+    // 渲染【最近 POI 的富详情】（高德官网风格）
+    function renderNearestPoi(p, detail) {
+        if (!p) return '';
+        // detail 优先（字段更全），fallback 用 around 返回的简版
+        const d = detail || p;
+        const name = escapeHtml(d.name || p.name || '');
+        const dist = fmtDist(p.distance);
+        const typeFull = d.type || p.type || '';
+        const typeLast = typeFull ? typeFull.split(';').slice(-1)[0] : '';
+        const address = pick(d, 'address') || pick(p, 'address') || '';
+        const tel = pick(d, 'tel') || pick(p, 'tel') || '';
+        const bizArea = pick(d, 'business_area') || '';
+        const bizExt = (d && typeof d.biz_ext === 'object' && !Array.isArray(d.biz_ext)) ? d.biz_ext : null;
+        const rating = bizExt ? pick(bizExt, 'rating') : '';
+        const cost = bizExt ? pick(bizExt, 'cost') : '';
+        const openTime = bizExt ? (pick(bizExt, 'open_time') || pick(bizExt, 'open_time_week') || pick(bizExt, 'opentime2')) : '';
+        const photosArr = (d && Array.isArray(d.photos)) ? d.photos : [];
+
+        let html = `<div class="cp-poi-detail">`;
+        html += `<div class="pd-head"><div class="pd-name">${name}</div><div class="pd-dist">📍 ${dist}</div></div>`;
+        if (typeLast) {
+            html += `<div><span class="pd-tag">${escapeHtml(typeLast)}</span></div>`;
+        }
+        // 评分 / 人均
+        const metaParts = [];
+        if (rating) metaParts.push(`<span class="mi">⭐ <b>${escapeHtml(String(rating))}</b></span>`);
+        if (cost)   metaParts.push(`<span class="mi">💰 ¥<b>${escapeHtml(String(cost))}</b>/人</span>`);
+        if (metaParts.length) html += `<div class="pd-meta">${metaParts.join('')}</div>`;
+        // 地址
+        if (address) html += `<div class="pd-row"><span class="ic">📍</span> ${escapeHtml(String(address))}</div>`;
+        // 商圈
+        if (bizArea) html += `<div class="pd-row"><span class="ic">🏙</span> ${escapeHtml(String(bizArea))}</div>`;
+        // 营业时间
+        if (openTime) html += `<div class="pd-row"><span class="ic">🕐</span> ${escapeHtml(String(openTime))}</div>`;
+        // 电话
+        if (tel) html += `<div class="pd-row"><span class="ic">📞</span> ${escapeHtml(String(tel))}</div>`;
+        // 图片
+        if (photosArr.length) {
+            html += `<div class="pd-photos">`;
+            for (const ph of photosArr.slice(0, 6)) {
+                const u = ph && ph.url;
+                if (!u) continue;
+                html += `<img src="${escapeHtml(u)}" alt="" loading="lazy" onclick="window.open(this.src,'_blank')">`;
+            }
+            html += `</div>`;
+        }
+        html += `</div>`;
+        return html;
+    }
+
+    // 用拿到的数据填充卡片中部
+    function renderInfoBody(regeo, pois, nearestDetail) {
+        let html = '';
+        if (regeo) {
+            const ac = regeo.addressComponent || {};
+            const formatted = regeo.formatted_address || '（无格式化地址）';
+            const district = [ac.province, ac.city, ac.district].filter(Boolean).join(' / ');
+            html += `<div class="cp-row"><span class="lbl">地址:</span> ${escapeHtml(formatted)}</div>`;
+            if (district) html += `<div class="cp-row"><span class="lbl">行政区:</span> ${escapeHtml(district)}</div>`;
+            if (ac.adcode) html += `<div class="cp-row"><span class="lbl">编码:</span> ${escapeHtml(ac.adcode)}</div>`;
+        } else {
+            html += `<div class="cp-warn">⚠️ 未配置高德 Key，无法解析地址</div>`;
+        }
+
+        // 最近 POI 富详情
+        const arr = Array.isArray(pois) ? pois : [];
+        if (arr.length > 0) {
+            html += renderNearestPoi(arr[0], nearestDetail);
+            // 其他附近 POI（简表）
+            if (arr.length > 1) {
+                html += `<div class="cp-others"><h5>其他附近 POI</h5><ul>`;
+                for (const p of arr.slice(1, 5)) {
+                    const nm = escapeHtml(p.name || '');
+                    const ds = fmtDist(p.distance);
+                    html += `<li><span class="nm">${nm}</span><span class="ds">${ds}</span></li>`;
+                }
+                html += `</ul></div>`;
+            }
+        } else if (regeo) {
+            html += `<div class="cp-pois"><h5>🏷 附近 POI</h5><div style="color:#999;font-size:12px;">50m 内未找到 POI</div></div>`;
+        }
+        return html;
+    }
+
+    // -------------------- 主点击处理 --------------------
+    async function onMapClick(e) {
+        if (!state.enabled) return;
+        // 如果点击的是 marker / 控件 / popup，Leaflet 默认不会触发 map click，但 e.originalEvent.target 可保险
+        const target = e.originalEvent && e.originalEvent.target;
+        if (target && target.closest && target.closest('.leaflet-marker-icon, .leaflet-control, .leaflet-popup, .three-d-panel')) {
+            return;
+        }
+
+        // 若已有上一个 popup，关闭
+        closeCurrent();
+
+        // ⚠️ 坐标系修正：本项目使用高德 GCJ-02 瓦片，所以 Leaflet 上点击得到的 e.latlng
+        //    本身就是 GCJ-02（"显示坐标"），不能再走一次 wgs84ToGcj02 否则会偏 ~500m
+        const gcjLat = e.latlng.lat;
+        const gcjLng = e.latlng.lng;
+        // 反算真实 WGS-84（仅用于卡片显示，不影响 API 调用）：
+        // 通用近似法：wgs ≈ gcj - (wgs84ToGcj02(gcj) - gcj)，单次迭代精度 < 1m，已足够展示
+        let wgsLat = gcjLat, wgsLng = gcjLng;
+        if (CoordTransform && CoordTransform.wgs84ToGcj02) {
+            try {
+                const arr = CoordTransform.wgs84ToGcj02(gcjLng, gcjLat);
+                if (Array.isArray(arr) && arr.length >= 2) {
+                    const dLng = arr[0] - gcjLng;
+                    const dLat = arr[1] - gcjLat;
+                    wgsLng = gcjLng - dLng;
+                    wgsLat = gcjLat - dLat;
+                }
+            } catch (_) {}
+        }
+
+        const reqId = ++state.currentReqId;
+
+        // 临时 marker
+        const marker = L.circleMarker(e.latlng, {
+            radius: 7, color: '#1976d2', fillColor: '#42a5f5',
+            fillOpacity: 0.9, weight: 2,
+        }).addTo(map);
+        state.currentMarker = marker;
+
+        // popup
+        const popup = L.popup({
+            className: 'cp-popup',
+            maxWidth: 280,
+            autoClose: true,
+            closeOnClick: false,
+            offset: [0, -4],
+        })
+            .setLatLng(e.latlng)
+            .setContent(renderCardLoading(wgsLat, wgsLng, gcjLat, gcjLng))
+            .openOn(map);
+        state.currentPopup = popup;
+
+        // 绑定按钮（popup open 后 DOM 才存在）
+        setTimeout(() => bindCardActions(popup, { wgsLat, wgsLng, gcjLat, gcjLng }), 0);
+
+        // 异步加载详情
+        let regeo = null;
+        let pois = [];
+        try {
+            [regeo, pois] = await Promise.all([
+                regeoLookup(gcjLng, gcjLat).catch(err => { console.warn('[ClickPlace] regeo 失败:', err); return null; }),
+                aroundLookup(gcjLng, gcjLat, 50).catch(err => { console.warn('[ClickPlace] around 失败:', err); return []; }),
+            ]);
+        } catch (err) {
+            console.warn('[ClickPlace] 加载失败:', err);
+        }
+
+        // 竞态保护：如果用户已点其他地方，丢弃旧结果
+        if (reqId !== state.currentReqId) return;
+
+        // 拿到最近 POI 的 ID，再请求一次 POI 详情接口（取电话/营业时间/评分/图片等富字段）
+        let nearestDetail = null;
+        if (pois && pois.length > 0 && pois[0] && pois[0].id) {
+            try {
+                nearestDetail = await poiDetailLookup(pois[0].id);
+            } catch (err) {
+                console.warn('[ClickPlace] POI detail 失败:', err);
+            }
+            // 详情拿回来后再做一次竞态保护
+            if (reqId !== state.currentReqId) return;
+        }
+
+        // 关键修复：直接 setContent 替换整个 popup 内容
+        // —— 这样 Leaflet 内部 _content 会同步更新，不会被后续 popup.update() 回滚成 loading 模板
+        try {
+            popup.setContent(renderCardFull(wgsLat, wgsLng, gcjLat, gcjLng, regeo, pois, nearestDetail));
+        } catch (err) {
+            console.warn('[ClickPlace] setContent 失败，降级为 DOM 注入:', err);
+            // 降级兜底：直接改 DOM
+            const cardEl = document.querySelector('.cp-popup [data-cp-card]');
+            const infoEl = cardEl && cardEl.querySelector('[data-cp-info]');
+            if (infoEl) {
+                infoEl.classList.remove('cp-loading');
+                infoEl.innerHTML = renderInfoBody(regeo, pois, nearestDetail);
+            }
+        }
+        // 内容已替换，重新绑定按钮事件（旧 DOM 已被 Leaflet 销毁）
+        bindCardActions(popup, { wgsLat, wgsLng, gcjLat, gcjLng });
+    }
+
+    function bindCardActions(popup, ctx) {
+        const root = popup.getElement();
+        if (!root) return;
+        const card = root.querySelector('[data-cp-card]');
+        if (!card) return;
+
+        card.addEventListener('click', async (ev) => {
+            const btn = ev.target.closest('[data-cp-act]');
+            if (!btn) return;
+            const act = btn.getAttribute('data-cp-act');
+
+            if (act === 'copy') {
+                const text = `WGS84: ${ctx.wgsLng.toFixed(6)}, ${ctx.wgsLat.toFixed(6)}\nGCJ02: ${ctx.gcjLng.toFixed(6)}, ${ctx.gcjLat.toFixed(6)}`;
+                const ok = await copyToClipboard(text);
+                btn.textContent = ok ? '✅ 已复制' : '⚠️ 复制失败';
+                setTimeout(() => { btn.textContent = '📋 复制坐标'; }, 1500);
+            } else if (act === 'nav') {
+                // 尝试调用项目里已有的"设为终点"接口
+                const fn = window.setNavDestination
+                    || window.setRouteDest
+                    || window.__nav
+                    || (window.__navFx && window.__navFx.setDest);
+                let handled = false;
+                if (typeof fn === 'function') {
+                    try { fn({ lat: ctx.wgsLat, lng: ctx.wgsLng }); handled = true; } catch (_) {}
+                }
+                if (!handled) {
+                    // 兜底：dispatch 自定义事件，业务方可监听
+                    window.dispatchEvent(new CustomEvent('app:set-route-dest', {
+                        detail: { lat: ctx.wgsLat, lng: ctx.wgsLng }
+                    }));
+                    btn.textContent = '✅ 已派发事件';
+                    setTimeout(() => { btn.textContent = '🚗 设为终点'; }, 1500);
+                } else {
+                    btn.textContent = '✅ 已设为终点';
+                    setTimeout(() => closeCurrent(), 800);
+                }
+            }
+        });
+    }
+
+    function closeCurrent() {
+        if (state.currentPopup) {
+            map.closePopup(state.currentPopup);
+            state.currentPopup = null;
+        }
+        if (state.currentMarker) {
+            map.removeLayer(state.currentMarker);
+            state.currentMarker = null;
+        }
+    }
+
+    // -------------------- 顶部开关按钮 --------------------
+    const ClickPlaceToggle = L.Control.extend({
+        options: { position: 'topright' },
+        onAdd() {
+            const wrap = L.DomUtil.create('div', 'leaflet-bar');
+            const btn = L.DomUtil.create('a', 'click-place-toggle active', wrap);
+            btn.href = '#';
+            btn.title = '点击地图查看地名详情（点此切换开关）';
+            btn.innerHTML = '📍<span class="badge">✓</span>';
+
+            L.DomEvent.disableClickPropagation(wrap);
+            L.DomEvent.disableScrollPropagation(wrap);
+
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                state.enabled = !state.enabled;
+                btn.classList.toggle('active', state.enabled);
+                btn.title = state.enabled
+                    ? '点击地图查看地名详情（已开启，点此关闭）'
+                    : '点击地图查看地名详情（已关闭，点此开启）';
+                if (!state.enabled) closeCurrent();
+            });
+
+            return wrap;
+        },
+    });
+    new ClickPlaceToggle().addTo(map);
+
+    // -------------------- 监听 --------------------
+    map.on('click', onMapClick);
+
+    // 暴露调试入口
+    window.__clickPlace = {
+        state,
+        regeoLookup,
+        aroundLookup,
+        poiDetailLookup,
+        closeCurrent,
+        setEnabled(v) { state.enabled = !!v; },
+    };
+
+    if (!AMAP_KEY) {
+        console.warn('[ClickPlace] 未检测到 AMAP_WEB_KEY，仅显示坐标，地址解析不可用');
+    }
+    console.log('%c[ClickPlace] 📍 点击地图获取地名详情已加载',
+        'color:#fff;background:#43a047;padding:2px 6px;border-radius:3px;font-weight:bold');
+})();
+
+// ============== deck.gl 3D 立柱图模块 ==============
+// 通过传入 CoordTransform，让模块内的 WGS-84 数据自动纠偏到 GCJ-02（与高德瓦片对齐）
+try {
+    initDeckGL3D(map, { coordTransform: CoordTransform });
+} catch (err) {
+    console.warn('[DeckGL3D] 初始化失败:', err);
+}

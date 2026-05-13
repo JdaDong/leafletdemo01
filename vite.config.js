@@ -28,7 +28,8 @@ export default defineConfig({
     build: {
         outDir: 'dist',
         sourcemap: true,
-        target: 'es2018',
+        // ES2020 才支持 BigInt 字面量（0n），deck.gl 内部用到，必须 >= es2020
+        target: 'es2020',
         // 对 leaflet 等大依赖做分包，减小主 chunk
         rollupOptions: {
             output: {
@@ -37,9 +38,20 @@ export default defineConfig({
                     'leaflet-plugins': ['leaflet.markercluster', 'leaflet-fullscreen', 'leaflet.heat', 'leaflet-ant-path', 'leaflet-timedimension'],
                     'leaflet-geoman': ['@geoman-io/leaflet-geoman-free'],
                     turf: ['@turf/turf'],
+                    // deck.gl 体积较大，单独分包
+                    deckgl: ['deck.gl'],
                 },
             },
         },
+    },
+    // 开发模式下 esbuild 也要用 es2020，否则 dev server 会报 BigInt 字面量错误
+    optimizeDeps: {
+        esbuildOptions: {
+            target: 'es2020',
+        },
+    },
+    esbuild: {
+        target: 'es2020',
     },
     // VITE_ 前缀的环境变量会被注入到 import.meta.env
     envPrefix: 'VITE_',
