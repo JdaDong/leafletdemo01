@@ -2310,6 +2310,8 @@ function clearRoutePolyline() {
     stopTrackAnim();
     // 同时停掉实时导航（如有）
     if (typeof stopNavigation === 'function') stopNavigation({ silent: true });
+    // 清理路书路口标记
+    if (typeof clearTurnMarkers === 'function') clearTurnMarkers();
     if (routePolyline) { map.removeLayer(routePolyline); routePolyline = null; }
     // 公交模式的多段线
     if (transitPolylines.length) {
@@ -2474,6 +2476,10 @@ function renderMainRoute(idx) {
             el.classList.toggle('active', i === selectedAlternativeIdx);
         });
     }
+
+    // ⭐ 路书面板（默认折叠）+ 地图路口箭头标记（方案 C）
+    renderRouteSteps(main.steps || [], routeMode);
+    renderTurnMarkers(main.steps || [], main.color || modeColorMap[routeMode]);
 }
 
 // 渲染候选方案卡片列表（仅当超过 1 条路径时显示）
@@ -2505,6 +2511,281 @@ function renderRouteAlternatives() {
         });
     });
 }
+
+/* ================================================================
+ *  📋 路书面板（方案 C-A）+ 🪧 路口箭头标记（方案 C-B）+ 双向联动
+ * ================================================================ */
+let turnMarkers = [];           // 当前路线的所有路口 marker
+let routeStepsEl = null;        // 路书 DOM 容器（懒创建，挂在 routeSummaryEl 之后）
+
+// —— 文案与图标映射 ——
+function _stepEmoji(action, isWaypoint) {
+    if (isWaypoint) return '📍';
+    const a = (action || '').toString();
+    if (!a) return '⬆️';
+    if (a.includes('左转') || a.includes('左前') || a.includes('左后')) return '↖️';
+    if (a.includes('右转') || a.includes('右前') || a.includes('右后')) return '↗️';
+    if (a.includes('掉头') || a.includes('调头')) return '↩️';
+    if (a.includes('靠左')) return '⬅️';
+    if (a.includes('靠右')) return '➡️';
+    if (a.includes('直行')) return '⬆️';
+    if (a.includes('到达') || a.includes('终点')) return '🏁';
+    if (a.includes('出发') || a.includes('起点')) return '🚩';
+    if (a.includes('进入') || a.includes('上桥') || a.includes('过桥') || a.includes('隧道')) return '➡️';
+    return '⬆️';
+}
+
+function _shouldShowTurnMarker(action) {
+    const a = (action || '').toString();
+    if (!a) return false;
+    // 直行 / 沿当前道路 不放路口标记，避免太密
+    if (a.includes('直行') && !a.includes('左') && !a.includes('右')) return false;
+    if (a.includes('继续')) return false;
+    return /左|右|掉头|调头|靠|进入|出口|环岛|匝道|过桥|隧道|到达/.test(a);
+}
+
+// —— 给一段 step 文案 ——
+function _stepLineText(step, isLast) {
+    if (step.isWaypoint) {
+        return `<b style="color:#8E24AA;">${escapeHtml(step.instruction || '途经点')}</b>`;
+    }
+    // 优先使用接口 instruction（最完整），否则自己拼
+    if (step.instruction) {
+        return escapeHtml(step.instruction);
+    }
+    const dirTxt = step.orientation ? `向${step.orientation}` : '';
+    const roadTxt = step.road ? `沿<b>${escapeHtml(step.road)}</b>` : '';
+    const actTxt = step.action ? `，${escapeHtml(step.action)}` : '';
+    const head = [roadTxt, dirTxt].filter(Boolean).join('');
+    return `${head}${actTxt}`;
+}
+
+// —— 渲染路书面板（默认折叠） ——
+function renderRouteSteps(steps, mode) {
+    // 移除旧面板
+    if (routeStepsEl) { try { routeStepsEl.remove(); } catch (_) {} routeStepsEl = null; }
+    if (!steps || !steps.length) return;
+    if (!routeSummaryEl) return;
+
+    const modeLabel = ({ driving: '驾车', walking: '步行', bicycling: '骑行' })[mode] || '路线';
+    const totalDist = steps.reduce((s, x) => s + (x.distance || 0), 0);
+
+    const container = document.createElement('details');
+    container.className = 'route-steps-panel';
+    container.open = false;  // 默认折叠
+    container.innerHTML = `
+        <summary class="rsp-summary">
+            <span class="rsp-icon">📋</span>
+            <span class="rsp-title">详细路书 · ${modeLabel}</span>
+            <span class="rsp-count">${steps.filter(s => !s.isWaypoint).length} 步</span>
+            <span class="rsp-arrow">▾</span>
+        </summary>
+        <ol class="rsp-list">
+            ${steps.map((step, i) => {
+                const emoji = _stepEmoji(step.action, step.isWaypoint);
+                const distTxt = (step.distance && !step.isWaypoint)
+                    ? `<span class="rsp-dist">${formatDistance(step.distance)}</span>` : '';
+                const lineText = _stepLineText(step, i === steps.length - 1);
+                const itemCls = step.isWaypoint ? 'rsp-item rsp-item-wp' : 'rsp-item';
+                return `
+                    <li class="${itemCls}" data-step-idx="${i}">
+                        <span class="rsp-num">${i + 1}</span>
+                        <span class="rsp-emoji">${emoji}</span>
+                        <span class="rsp-text">${lineText}</span>
+                        ${distTxt}
+                    </li>`;
+            }).join('')}
+        </ol>
+    `;
+
+    routeSummaryEl.appendChild(container);
+    routeStepsEl = container;
+
+    // 路书项点击 → 飞到对应路口起点 + 高亮地图标记 + 自身高亮
+    container.querySelectorAll('.rsp-item').forEach(li => {
+        li.addEventListener('click', () => {
+            const idx = parseInt(li.getAttribute('data-step-idx'), 10);
+            const step = steps[idx];
+            if (!step || !step.startCoord) return;
+            map.flyTo(step.startCoord, Math.max(map.getZoom(), 17), { duration: 0.6 });
+
+            // 取消其它高亮
+            container.querySelectorAll('.rsp-item.active').forEach(el => el.classList.remove('active'));
+            li.classList.add('active');
+
+            // 高亮对应的路口标记（如果有）
+            highlightTurnMarker(idx);
+        });
+    });
+}
+
+// —— 渲染地图上的路口箭头标记 ——
+function clearTurnMarkers() {
+    turnMarkers.forEach(m => { try { map.removeLayer(m.marker); } catch (_) {} });
+    turnMarkers = [];
+}
+
+function renderTurnMarkers(steps, mainColor) {
+    clearTurnMarkers();
+    if (!steps || !steps.length) return;
+    const color = mainColor || '#1E88E5';
+
+    steps.forEach((step, idx) => {
+        // 起点和终点用特殊标记；其余仅在路口动作时放
+        const isFirst = idx === 0;
+        const isLast  = idx === steps.length - 1;
+        const isWp = !!step.isWaypoint;
+        const showAsTurn = _shouldShowTurnMarker(step.action);
+        if (!isFirst && !isLast && !isWp && !showAsTurn) return;
+        if (!step.startCoord) return;
+
+        const emoji = _stepEmoji(step.action, isWp);
+        const tag = isWp ? '途经'
+                  : isFirst ? '起'
+                  : isLast  ? '终'
+                  : (step.action || '路口');
+
+        const html = `
+            <div class="tm-wrap" style="--tm-color:${color};">
+                <div class="tm-bubble">
+                    <span class="tm-emoji">${emoji}</span>
+                    <span class="tm-tag">${escapeHtml(tag)}</span>
+                </div>
+                <div class="tm-tail"></div>
+            </div>`;
+        const icon = L.divIcon({
+            html,
+            className: 'turn-marker-icon',
+            iconSize: [0, 0],
+            iconAnchor: [0, 0]
+        });
+        const marker = L.marker(step.startCoord, { icon, zIndexOffset: 600 }).addTo(map);
+
+        // 悬停 / 点击：完整指令
+        const tip = (step.instruction || _stepLineText(step, isLast)).replace(/<\/?b>/g, '');
+        marker.bindTooltip(tip, { direction: 'top', offset: [0, -10], sticky: false });
+        marker.on('click', () => {
+            // 联动：高亮路书对应项
+            if (routeStepsEl) {
+                routeStepsEl.open = true;
+                routeStepsEl.querySelectorAll('.rsp-item.active').forEach(el => el.classList.remove('active'));
+                const li = routeStepsEl.querySelector(`.rsp-item[data-step-idx="${idx}"]`);
+                if (li) {
+                    li.classList.add('active');
+                    li.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            }
+            highlightTurnMarker(idx);
+        });
+
+        turnMarkers.push({ idx, marker });
+    });
+}
+
+function highlightTurnMarker(idx) {
+    turnMarkers.forEach(({ idx: i, marker }) => {
+        const el = marker.getElement && marker.getElement();
+        if (!el) return;
+        const wrap = el.querySelector('.tm-wrap');
+        if (wrap) wrap.classList.toggle('tm-active', i === idx);
+    });
+}
+
+// —— 路书 + 路口标记的样式（一次性注入到 head） ——
+(function injectRouteStepsStyle() {
+    if (document.getElementById('route-steps-style')) return;
+    const style = document.createElement('style');
+    style.id = 'route-steps-style';
+    style.textContent = `
+        .route-steps-panel {
+            margin-top: 8px;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            background: #fafafa;
+            font-size: 12px;
+        }
+        .route-steps-panel > .rsp-summary {
+            cursor: pointer; padding: 6px 8px; list-style: none;
+            display: flex; align-items: center; gap: 6px; user-select: none;
+            border-radius: 6px; outline: none;
+        }
+        .route-steps-panel > .rsp-summary::-webkit-details-marker { display: none; }
+        .route-steps-panel > .rsp-summary:hover { background: #f0f0f0; }
+        .route-steps-panel .rsp-icon { font-size: 14px; }
+        .route-steps-panel .rsp-title { font-weight: 600; color: #333; flex: 1; }
+        .route-steps-panel .rsp-count {
+            font-size: 11px; color: #666; background: #fff;
+            padding: 1px 6px; border-radius: 8px; border: 1px solid #ddd;
+        }
+        .route-steps-panel .rsp-arrow {
+            transition: transform .15s; color: #888; font-size: 12px;
+        }
+        .route-steps-panel[open] .rsp-arrow { transform: rotate(180deg); }
+        .route-steps-panel .rsp-list {
+            margin: 0; padding: 4px 0; list-style: none;
+            max-height: 280px; overflow-y: auto;
+            border-top: 1px solid #eee; background: #fff;
+            border-bottom-left-radius: 6px; border-bottom-right-radius: 6px;
+        }
+        .route-steps-panel .rsp-item {
+            padding: 6px 8px 6px 6px; display: flex; align-items: flex-start; gap: 6px;
+            border-bottom: 1px dashed #f0f0f0; cursor: pointer;
+            transition: background .12s;
+        }
+        .route-steps-panel .rsp-item:last-child { border-bottom: none; }
+        .route-steps-panel .rsp-item:hover { background: #f5faff; }
+        .route-steps-panel .rsp-item.active { background: #fff8e1; box-shadow: inset 3px 0 0 #FB8C00; }
+        .route-steps-panel .rsp-item-wp { background: #faf3ff; }
+        .route-steps-panel .rsp-item-wp:hover { background: #f3e5f5; }
+        .route-steps-panel .rsp-num {
+            min-width: 18px; height: 18px; line-height: 18px; text-align: center;
+            background: #1E88E5; color: #fff; border-radius: 50%;
+            font-size: 10px; font-weight: 600; flex-shrink: 0; margin-top: 1px;
+        }
+        .route-steps-panel .rsp-item-wp .rsp-num { background: #8E24AA; }
+        .route-steps-panel .rsp-emoji { font-size: 14px; flex-shrink: 0; line-height: 18px; }
+        .route-steps-panel .rsp-text { flex: 1; color: #333; line-height: 1.5; word-break: break-all; }
+        .route-steps-panel .rsp-text b { color: #1E88E5; }
+        .route-steps-panel .rsp-dist {
+            font-size: 11px; color: #888; background: #f0f0f0;
+            padding: 1px 6px; border-radius: 8px; flex-shrink: 0; margin-top: 1px;
+            white-space: nowrap;
+        }
+
+        /* 路口标记气泡 */
+        .turn-marker-icon { background: transparent !important; border: 0 !important; }
+        .tm-wrap {
+            position: absolute;
+            transform: translate(-50%, -100%);
+            display: inline-flex; flex-direction: column; align-items: center;
+            pointer-events: auto;
+        }
+        .tm-bubble {
+            background: var(--tm-color, #1E88E5);
+            color: #fff; padding: 2px 7px; border-radius: 10px;
+            font-size: 11px; font-weight: 600; line-height: 1.4;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+            display: inline-flex; align-items: center; gap: 3px;
+            white-space: nowrap;
+            border: 2px solid #fff;
+        }
+        .tm-emoji { font-size: 12px; }
+        .tm-tail {
+            width: 0; height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 6px solid var(--tm-color, #1E88E5);
+            margin-top: -1px;
+            filter: drop-shadow(0 1px 0 #fff);
+        }
+        .tm-wrap.tm-active .tm-bubble {
+            transform: scale(1.18);
+            box-shadow: 0 0 0 3px rgba(255, 193, 7, 0.6), 0 2px 6px rgba(0,0,0,0.25);
+            transition: transform .15s, box-shadow .15s;
+        }
+    `;
+    document.head.appendChild(style);
+})();
 
 // ============== 步行 / 骑行的"分段拼接式途径点"工具函数 ==============
 // 高德 walking / bicycling 接口本身不支持 waypoints 参数，
@@ -2544,11 +2825,28 @@ async function planRouteWithWaypointsSegmented(mode, origin, dest, waypoints) {
         }
         if (!path) throw new Error('某段路径无结果');
         const coords = [];
+        const stepsMeta = [];
         (path.steps || []).forEach(step => {
-            coords.push(...parseAmapPolyline(step.polyline));
+            const segCoords = parseAmapPolyline(step.polyline);
+            if (!segCoords.length) return;
+            const idxStart = coords.length;
+            coords.push(...segCoords);
+            stepsMeta.push({
+                road: step.road || '',
+                instruction: step.instruction || '',
+                action: step.action || '',
+                assistAction: step.assistant_action || step.assist_action || '',
+                orientation: step.orientation || '',
+                distance: Number(step.distance) || 0,
+                duration: Number(step.duration) || 0,
+                startCoord: segCoords[0],
+                endCoord: segCoords[segCoords.length - 1],
+                coordIdxStart: idxStart
+            });
         });
         return {
             coords,
+            steps: stepsMeta,
             distance: Number(path.distance) || 0,
             duration: Number(path.duration) || 0
         };
@@ -2561,13 +2859,15 @@ async function planRouteWithWaypointsSegmented(mode, origin, dest, waypoints) {
     }
     const segs = await Promise.all(tasks);
 
-    // 拼接 coords：相邻段尾点 / 头点重合时只保留一个
+    // 拼接 coords：相邻段尾点 / 头点重合时只保留一个；同时合并 steps 元信息
     const merged = [];
+    const mergedSteps = [];
     let totalDist = 0, totalDur = 0;
     segs.forEach((seg, idx) => {
         totalDist += seg.distance;
         totalDur += seg.duration;
         if (!seg.coords.length) return;
+        let dropFirst = false;
         if (idx === 0) {
             merged.push(...seg.coords);
         } else {
@@ -2576,11 +2876,37 @@ async function planRouteWithWaypointsSegmented(mode, origin, dest, waypoints) {
             // 距离 < 1m 视为同点 -> 跳过首点
             const dup = last && first && Math.abs(last[0] - first[0]) < 1e-5
                                        && Math.abs(last[1] - first[1]) < 1e-5;
+            dropFirst = !!dup;
             merged.push(...(dup ? seg.coords.slice(1) : seg.coords));
+
+            // 段与段之间插入一个"途经点"合成 step（用户能在路书里看到 waypoint 提示）
+            const wpName = (idx - 1 >= 0 && idx - 1 < waypoints.length && waypoints[idx - 1].name)
+                ? waypoints[idx - 1].name : `途经点 ${idx}`;
+            mergedSteps.push({
+                road: '',
+                instruction: `经过${wpName}`,
+                action: '途经点',
+                assistAction: '',
+                orientation: '',
+                distance: 0,
+                duration: 0,
+                startCoord: first,
+                endCoord: first,
+                coordIdxStart: merged.length - seg.coords.length + (dropFirst ? 0 : 0),
+                isWaypoint: true
+            });
         }
+        // 把本段的 steps 平移 coordIdxStart 后追加
+        const baseIdx = merged.length - seg.coords.length + (dropFirst ? -1 : 0);
+        (seg.steps || []).forEach(s => {
+            mergedSteps.push({
+                ...s,
+                coordIdxStart: Math.max(0, baseIdx + s.coordIdxStart - (dropFirst && s.coordIdxStart > 0 ? 1 : 0))
+            });
+        });
     });
 
-    return { coords: merged, distance: totalDist, duration: totalDur };
+    return { coords: merged, steps: mergedSteps, distance: totalDist, duration: totalDur };
 }
 
 async function planRoute() {
@@ -2618,6 +2944,7 @@ async function planRoute() {
             const merged = await planRouteWithWaypointsSegmented(routeMode, routeOrigin, routeDestination, routeWaypoints);
             alternativeData = [{
                 coords: merged.coords,
+                steps: merged.steps || [],
                 distance: merged.distance,
                 duration: merged.duration,
                 strategyText: `${routeMode === 'walking' ? '步行' : '骑行'} · ${routeWaypoints.length} 个途经点（分段拼接）`,
@@ -2668,14 +2995,31 @@ async function planRoute() {
             paths = isMultiStrategy ? all.slice(0, 3) : all.slice(0, 1);
         }
 
-        // 把每条 path 拍平成 coords + meta
+        // 把每条 path 拍平成 coords + meta（同时保留每个 step 的语义信息，供路书 / 路口标记使用）
         const pathInfos = paths.map((p, i) => {
             const coords = [];
+            const stepsMeta = []; // 每步：{ road, instruction, action, assistAction, orientation, distance, duration, startCoord, endCoord, coordIdxStart }
             (p.steps || []).forEach(step => {
-                coords.push(...parseAmapPolyline(step.polyline));
+                const segCoords = parseAmapPolyline(step.polyline);
+                if (!segCoords.length) return;
+                const idxStart = coords.length;
+                coords.push(...segCoords);
+                stepsMeta.push({
+                    road: step.road || '',
+                    instruction: step.instruction || '',
+                    action: step.action || '',
+                    assistAction: step.assistant_action || step.assist_action || '',
+                    orientation: step.orientation || '',
+                    distance: Number(step.distance) || 0,
+                    duration: Number(step.duration) || 0,
+                    startCoord: segCoords[0],
+                    endCoord: segCoords[segCoords.length - 1],
+                    coordIdxStart: idxStart
+                });
             });
             return {
                 coords,
+                steps: stepsMeta,
                 distance: Number(p.distance) || 0,
                 duration: Number(p.duration) || 0,
                 strategyText: p.strategy || '',
@@ -5585,6 +5929,7 @@ function startTimeDimensionDemo() {
             speedSlider: true
         });
         map.addControl(timeDimensionControl);
+        attachTimelineCloseBtn(timeDimensionControl, stopTimeDimensionDemo, { title: '关闭时间轴演示' });
     }
 
     // 自适应到第一帧
@@ -5603,6 +5948,71 @@ function stopTimeDimensionDemo() {
         try { map.removeControl(timeDimensionControl); } catch (_) {}
         timeDimensionControl = null;
     }
+}
+
+/* =========================================================================
+ *  ⏱ 时间轴控件统一关闭按钮（✕）
+ *  - 三处时间轴（基础演示 / GDP / OD）共用
+ *  - 在 map.addControl(xxxControl) 之后调用，自动给控件 DOM 注入一个红底 ✕
+ *  - 点击后调用传入的 onClose 回调（即对应的 stopXxx()）
+ * ========================================================================= */
+function attachTimelineCloseBtn(tdControl, onClose, opts = {}) {
+    if (!tdControl) return;
+    // timedimension 控件 DOM 在 addControl 后才挂上去；用 setTimeout(0) 确保已渲染
+    setTimeout(() => {
+        try {
+            const container = tdControl.getContainer && tdControl.getContainer();
+            if (!container) return;
+            // 避免重复注入
+            if (container.querySelector('.tl-close-btn')) return;
+
+            const btn = document.createElement('button');
+            btn.className = 'tl-close-btn';
+            btn.type = 'button';
+            btn.title = opts.title || '关闭时间轴';
+            btn.textContent = '✕';
+            btn.style.cssText = `
+                position: absolute;
+                top: -10px;
+                right: -10px;
+                width: 22px;
+                height: 22px;
+                line-height: 18px;
+                padding: 0;
+                border: 2px solid #fff;
+                background: #E53935;
+                color: #fff;
+                border-radius: 50%;
+                font-size: 13px;
+                font-weight: 700;
+                cursor: pointer;
+                box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+                z-index: 1001;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            `;
+            btn.addEventListener('mouseenter', () => { btn.style.background = '#C62828'; });
+            btn.addEventListener('mouseleave', () => { btn.style.background = '#E53935'; });
+
+            // 阻止冒泡，避免触发 leaflet 控件的点击穿透到地图
+            L.DomEvent.disableClickPropagation(btn);
+            L.DomEvent.disableScrollPropagation(btn);
+
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                try { onClose && onClose(); } catch (err) { console.warn('[timeline-close]', err); }
+            });
+
+            // 控件 container 需要 relative 才能让 ✕ 绝对定位
+            const cs = window.getComputedStyle(container);
+            if (cs.position === 'static') container.style.position = 'relative';
+            container.appendChild(btn);
+        } catch (e) {
+            console.warn('[timeline-close] 注入失败', e);
+        }
+    }, 0);
 }
 
 const TimeDimensionControlBtn = L.Control.extend({
@@ -6133,6 +6543,7 @@ async function startGDPTimeline() {
         speedSlider: false
     });
     map.addControl(gdpTimelineControl);
+    attachTimelineCloseBtn(gdpTimelineControl, stopGDPTimeline, { title: '关闭 GDP 时间轴' });
 
     // 顶部年份大字
     gdpTimelineTitle = L.DomUtil.create('div', '', document.body);
@@ -6274,6 +6685,7 @@ async function startODTimeline() {
         speedSlider: false
     });
     map.addControl(odTimelineControl);
+    attachTimelineCloseBtn(odTimelineControl, stopODTimeline, { title: '关闭 OD 时间轴' });
 
     // 顶部月份大字
     odTimelineTitle = L.DomUtil.create('div', '', document.body);
@@ -6669,6 +7081,7 @@ let navArrowMarker  = null;               // 行进箭头 marker
 let navOffroutePoly = null;               // 偏航连接线（用户位置→最近路径点）
 let navReplanCooldown = 0;                // 偏航重规划冷却（毫秒时间戳）
 let navLastSpeed = 0;                     // 最近一次速度（m/s），用于估剩余时间
+let navSteps = [];                        // ⭐ 当前路径的高德 step 语义信息（road / action / instruction 等）
 let navMaxHistory = 30;                   // localStorage 最多保留多少条记录
 const NAV_HISTORY_KEY = 'leaflet_demo_nav_history_v1';
 
@@ -7145,6 +7558,7 @@ function startNavigation(mode) {
     const main = alternativeData[selectedAlternativeIdx] || alternativeData[0];
     navCoords     = main.coords.slice();
     navTotalDist  = navPolylineLength(navCoords);
+    navSteps      = (main.steps || []).slice();
     navTotalDur   = main.duration || 0;
     navOriginInfo = routeOrigin ? { ...routeOrigin } : null;
     navDestInfo   = routeDestination ? { ...routeDestination } : null;
@@ -7450,10 +7864,11 @@ async function triggerReplan(userLatLng) {
         await planRoute();
         // 用新方案重置导航参数（保持 RUNNING 状态）
         if (alternativeData && alternativeData.length) {
-            const main = alternativeData[selectedAlternativeIdx] || alternativeData[0];
+        const main = alternativeData[selectedAlternativeIdx] || alternativeData[0];
             navCoords = main.coords.slice();
             navTotalDist = navPolylineLength(navCoords);
             navTotalDur  = main.duration || 0;
+            navSteps     = (main.steps || []).slice();
             navWalkedDist = 0;
             setupNavLayers();
             updateArrowMarker(userLatLng, navBearingAt(navCoords, 0));
@@ -7469,6 +7884,51 @@ async function triggerReplan(userLatLng) {
 
 
 // -------------------- HUD 更新 --------------------
+
+// ⭐ 工具函数：根据已走距离，找出"当前所在 step"和"下一个非直行/到达 step"
+// navSteps 中每个 step 已带 coordIdxStart（路径坐标起点序号）
+function navFindCurrentAndNextStep(traveled) {
+    if (!navSteps || !navSteps.length || !navCoords || navCoords.length < 2) {
+        return { current: null, currentIdx: -1, next: null, nextIdx: -1, distToNext: 0 };
+    }
+    // 用累计长度数组定位"已走到哪个坐标段"
+    // 优化：每次都重算成本可控（步数通常 < 50），简洁优先
+    const cum = [0];
+    for (let i = 1; i < navCoords.length; i++) {
+        cum.push(cum[i - 1] + haversineMeters(navCoords[i - 1], navCoords[i]));
+    }
+    // 找当前坐标 idx
+    let curIdx = 0;
+    for (let i = 0; i < cum.length; i++) {
+        if (cum[i] <= traveled) curIdx = i; else break;
+    }
+    // 找当前 step：最大的 step.coordIdxStart <= curIdx
+    let currentIdx = 0;
+    for (let i = 0; i < navSteps.length; i++) {
+        if ((navSteps[i].coordIdxStart || 0) <= curIdx) currentIdx = i; else break;
+    }
+    // 下一个"值得提示"的 step（非直行 / 到达 / 途经点）
+    let nextIdx = -1;
+    for (let j = currentIdx + 1; j < navSteps.length; j++) {
+        const s = navSteps[j];
+        if (s.isWaypoint || _shouldShowTurnMarker(s.action) || j === navSteps.length - 1) {
+            nextIdx = j; break;
+        }
+    }
+    let distToNext = 0;
+    if (nextIdx >= 0) {
+        const nextStartIdx = navSteps[nextIdx].coordIdxStart || 0;
+        distToNext = Math.max(0, (cum[nextStartIdx] || 0) - traveled);
+    }
+    return {
+        current: navSteps[currentIdx] || null,
+        currentIdx,
+        next: nextIdx >= 0 ? navSteps[nextIdx] : null,
+        nextIdx,
+        distToNext
+    };
+}
+
 function updateHud(traveled, bearing) {
     const remain = Math.max(0, navTotalDist - traveled);
     const ratio  = navTotalDist > 0 ? Math.min(1, traveled / navTotalDist) : 0;
@@ -7483,29 +7943,72 @@ function updateHud(traveled, bearing) {
         remainSec = NaN;
     }
 
-    const turn = navFindNextTurn(navCoords, traveled, 1000);
+    // ⭐ 优先用 navSteps 给出"具体路名 + 路口动作"；没有 steps 时回落到几何拐弯检测
     let turnIcon = '⬆️', turnText = '沿当前道路直行';
-    if (turn) {
-        const t = navTurnToEmoji(turn.turnAngle);
-        turnIcon = t.icon;
-        turnText = `${navFmtDist(turn.distAhead)} 后${t.text}`;
-    } else if (remain < 80) {
-        turnIcon = '🏁';
-        turnText = `即将到达终点（${navFmtDist(remain)}）`;
+    let turnAngleForVoice = 0, distAheadForVoice = 0, voiceBucketKey = '';
+
+    const stepInfo = navFindCurrentAndNextStep(traveled);
+    if (stepInfo.next) {
+        const nx = stepInfo.next;
+        turnIcon = _stepEmoji(nx.action, nx.isWaypoint);
+        const da = stepInfo.distToNext;
+        const roadPart = nx.road ? `进入 ${nx.road}` : (nx.isWaypoint ? (nx.instruction || '途经点') : (nx.action || '路口'));
+        const actPart  = nx.action ? `${nx.action}` : '';
+        if (da < 30 && stepInfo.nextIdx === navSteps.length - 1) {
+            turnText = `🏁 即将到达终点（${navFmtDist(remain)}）`;
+        } else if (nx.isWaypoint) {
+            turnText = `${navFmtDist(da)} 后 ${nx.instruction || '到达途经点'}`;
+        } else if (nx.road) {
+            turnText = `${navFmtDist(da)} 后${actPart}进入 ${nx.road}`;
+        } else if (nx.instruction) {
+            turnText = `${navFmtDist(da)} 后 ${nx.instruction}`;
+        } else {
+            turnText = `${navFmtDist(da)} 后${actPart || '路口'}`;
+        }
+        distAheadForVoice = da;
+        // 同步当前 step 的"沿路名"提示
+        if (stepInfo.current && stepInfo.current.road && da > 80) {
+            const cur = stepInfo.current;
+            // 用更友好的提示前缀替换占位文案
+            // 例如：沿世纪大道，320 米后右转进入福山路
+            // 但 HUD 容量有限，只在 da > 80m 且当前 step 有 road 时显示
+            // 这里覆盖前面的 turnText 让用户先看到沿路名
+            const head = `沿 ${cur.road}`;
+            turnText = `${head} · ${turnText}`;
+        }
+    } else {
+        // 没有 step 信息 -> 回落到几何拐弯检测
+        const turn = navFindNextTurn(navCoords, traveled, 1000);
+        if (turn) {
+            const t = navTurnToEmoji(turn.turnAngle);
+            turnIcon = t.icon;
+            turnText = `${navFmtDist(turn.distAhead)} 后${t.text}`;
+            distAheadForVoice = turn.distAhead;
+            turnAngleForVoice = turn.turnAngle;
+        } else if (remain < 80) {
+            turnIcon = '🏁';
+            turnText = `即将到达终点（${navFmtDist(remain)}）`;
+        }
     }
 
     // A1 语音播报：在关键距离阈值处读一句
-    if (turn) {
-        const t2 = navTurnToEmoji(turn.turnAngle);
-        const da = turn.distAhead;
-        // 阈值梯度：~500m / ~200m / ~80m
+    if (distAheadForVoice > 0) {
+        const da = distAheadForVoice;
         let bucket = null;
         if (da > 380 && da < 520)      bucket = '500m';
         else if (da > 150 && da < 250) bucket = '200m';
         else if (da > 50  && da < 100) bucket = '80m';
         if (bucket) {
-            navSpeak(`前方 ${navFmtDist(da)} 后${t2.text}`,
-                { key: 'turn_' + turn.turnAngle.toFixed(0) + '_' + bucket });
+            // 优先朗读包含路名的提示
+            const speakText = stepInfo.next
+                ? (stepInfo.next.road
+                    ? `前方 ${navFmtDist(da)} 后${stepInfo.next.action || '路口'}进入${stepInfo.next.road}`
+                    : (stepInfo.next.instruction || `前方 ${navFmtDist(da)} 后路口`))
+                : `前方 ${navFmtDist(da)} 后路口`;
+            const key = stepInfo.next
+                ? `step_${stepInfo.nextIdx}_${bucket}`
+                : `turn_${turnAngleForVoice.toFixed(0)}_${bucket}`;
+            navSpeak(speakText, { key });
         }
     }
     // 接近终点语音（仅说一次）
@@ -7636,6 +8139,7 @@ function stopNavigation(opts = {}) {
     document.body.classList.remove('nav-fpv');
     navFpvOn = false;
     navWpCheckpoints = [];
+    navSteps = [];
 
     showNavHud(false);
 
